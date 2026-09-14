@@ -65,6 +65,20 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "No completed desktop"):
             manifest.build_manifest([releases[-1]], lambda tag: empty)
 
+    def test_retired_intel_macos_history_is_preserved_without_new_asset(self):
+        intel, arm = metadata(1), metadata(2)
+        for entry, name in ((intel, "Zed-x86_64.dmg"), (arm, "Zed-aarch64.dmg")):
+            entry["assets"][0]["name"] = name
+            entry["assets"][0]["browser_download_url"] = (
+                f"https://github.com/{manifest.REPOSITORY}/releases/download/"
+                f"{entry['tag_name']}/{name}")
+        entries = [intel, arm]
+        result = manifest.build_manifest([release(entry) for entry in entries], lambda tag: next(
+            entry for entry in entries if entry["tag_name"] == tag))
+        self.assertEqual(result["releases"], [arm, intel])
+        self.assertEqual([asset["name"] for asset in result["releases"][0]["assets"]],
+                         ["Zed-aarch64.dmg"])
+
     def test_feed_failure_does_not_replace_existing_output(self):
         data = metadata()
         for failure in (subprocess.CalledProcessError(1, "gh"), "not JSON",

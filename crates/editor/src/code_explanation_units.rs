@@ -142,6 +142,14 @@ pub fn parse_annotations(
         .filter(|annotation| {
             annotation.line > 0
                 && annotation.line <= lines.len()
+                && lines.get(annotation.line - 1).is_some_and(|line| {
+                    let line = line.trim();
+                    !line.is_empty()
+                        && line.chars().any(|character| character.is_alphanumeric())
+                        && !matches!(line, "else" | "else {" | "} else {" | "end")
+                        && !line.starts_with("//")
+                        && !line.starts_with('#')
+                })
                 && !commented_rows.contains(&(annotation.line - 1))
                 && !annotation.explanation.trim().is_empty()
                 && annotation.explanation.len() <= 4096
@@ -151,6 +159,7 @@ pub fn parse_annotations(
                     .any(|ch| ch.is_control() && ch != '\n' && ch != '\t')
                 && seen.insert(annotation.line)
         })
+        .take(16)
         .collect())
 }
 
@@ -193,6 +202,26 @@ mod tests {
             units
                 .iter()
                 .all(|unit| unit.range.len() <= MAX_INPUT_BYTES && unit.owner_lines > 500)
+        );
+    }
+
+    #[test]
+    fn structural_lines_are_not_explained() {
+        let code = "fn example() {\n\n}\n);\n// comment\nlet result = call();";
+        let output = (1..=6)
+            .map(|line| Annotation {
+                line,
+                explanation: "解释".into(),
+            })
+            .collect::<Vec<_>>();
+        let parsed =
+            parse_annotations(&serde_json::to_string(&output).unwrap(), code, &[]).unwrap();
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|annotation| annotation.line)
+                .collect::<Vec<_>>(),
+            vec![1, 6]
         );
     }
 
