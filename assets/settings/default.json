@@ -619,6 +619,17 @@
     // The layout of window control buttons in the title bar (Linux only).
     "button_layout": "platform_default",
   },
+  "code_explanations": {
+    "enabled": false,
+    "provider": null,
+    "model": null,
+    "target_language": "中文",
+    "max_function_lines": 500,
+    "detailed": false,
+    "prefer_existing_comments": true,
+    "cache_persist": true,
+    "cache_max_bytes": 52428800
+  },
   "hover_translation": {
     // Whether to automatically translate non-Chinese hover documentation
     // into the target language (shown underlined below the original text).

@@ -31,6 +31,8 @@ mod highlight_matching_bracket;
 pub mod hover_links;
 pub mod hover_popover;
 pub mod hover_translation;
+pub mod code_explanations;
+mod code_explanation_units;
 mod indent_guides;
 mod inlays;
 mod inline_input;
@@ -1075,6 +1077,7 @@ pub struct Editor {
     leader_id: Option<CollaboratorId>,
     remote_id: Option<ViewId>,
     pub hover_state: HoverState,
+    pub(crate) explanations: code_explanations::ExplanationState,
     pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
     prev_pressure_stage: Option<PressureStage>,
     gutter_hovered: bool,
@@ -2425,6 +2428,7 @@ impl Editor {
             leader_id: None,
             remote_id: None,
             hover_state: HoverState::default(),
+            explanations: code_explanations::ExplanationState::default(),
             pending_mouse_down: None,
             prev_pressure_stage: None,
             hovered_link_state: None,
@@ -9925,6 +9929,9 @@ impl Editor {
                 edited_buffer,
                 source,
             } => {
+                if self.explanations.version.is_some() {
+                    code_explanations::clear(self, cx);
+                }
                 self.scrollbar_marker_state.dirty = true;
                 self.active_indent_guides_state.dirty = true;
                 self.fit_gutter_line_number_width(false, cx);
@@ -10170,6 +10177,9 @@ impl Editor {
     }
 
     fn settings_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.explanations.version.is_some() {
+            code_explanations::clear(self, cx);
+        }
         let new_language_settings = self.fetch_applicable_language_settings(cx);
         let language_settings_changed = new_language_settings != self.applicable_language_settings;
         self.applicable_language_settings = new_language_settings;
@@ -10863,6 +10873,11 @@ impl Editor {
     }
 
     pub fn handle_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.explanations.write_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.explanations.task = None;
+        self.explanations.busy = false;
+        self.explanations.last_view = None;
+        self.explanations.generation = self.explanations.generation.wrapping_add(1);
         self.cursor_animations.clear();
         self.blink_manager.update(cx, BlinkManager::disable);
         self.buffer
@@ -12339,7 +12354,14 @@ impl Focusable for Editor {
 }
 
 impl Render for Editor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if code_explanations::CodeExplanationSettings::get_global(cx).enabled
+            || self.explanations.version.is_some()
+        {
+            cx.defer_in(window, |editor, window, cx| {
+                code_explanations::schedule(editor, window, cx);
+            });
+        }
         EditorElement::new(&cx.entity(), self.create_style(cx))
     }
 }

@@ -305,6 +305,9 @@ pub struct SettingsContent {
     /// Configuration for AI-powered translation in the editor's hover popovers.
     pub hover_translation: Option<HoverTranslationSettingsContent>,
 
+    /// Read-only AI explanations displayed above code. User configuration only.
+    pub code_explanations: Option<CodeExplanationSettingsContent>,
+
     /// Whether or not to enable Vim mode.
     ///
     /// Default: false
@@ -409,7 +412,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         journal, log, line_indicator_format, language_models, outline_panel, project_panel,
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
         title_bar, vim_mode, calls, which_key, vim, modeline_lines, feature_flags,
-        instrumentation, hover_translation,
+        instrumentation, hover_translation, code_explanations,
     },
     defaults: {},
 });

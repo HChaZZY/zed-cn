@@ -5416,9 +5416,15 @@ fn render_translation_model_picker(
     cx: &mut App,
 ) -> AnyElement {
     let store = SettingsStore::global(cx);
-    let (_, provider_value) = store.get_value_from_file(file.to_settings(), |content| {
-        content.hover_translation.as_ref()?.provider.as_ref()
-    });
+    let (_, provider_value) = if field.json_path == Some("code_explanations.model") {
+        store.get_value_from_file(file.to_settings(), |content| {
+            content.code_explanations.as_ref()?.provider.as_ref()
+        })
+    } else {
+        store.get_value_from_file(file.to_settings(), |content| {
+            content.hover_translation.as_ref()?.provider.as_ref()
+        })
+    };
     let provider_id: SharedString = provider_value
         .map(|provider| provider.0.as_str().into())
         .unwrap_or_default();

@@ -642,6 +642,11 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_left_item(merge_conflict_indicator, window, cx);
             status_bar.add_left_item(activity_indicator, window, cx);
             status_bar.add_left_item(file_transfer_indicator, window, cx);
+            let explanations = cx.new(|cx| {
+                cx.observe_global::<settings::SettingsStore>(|_, cx| cx.notify()).detach();
+                editor::code_explanations::CodeExplanationIndicator::default()
+            });
+            status_bar.add_right_item(explanations, window, cx);
             status_bar.add_right_item(edit_prediction_ui, window, cx);
             status_bar.add_right_item(active_buffer_encoding, window, cx);
             status_bar.add_right_item(active_buffer_language, window, cx);
