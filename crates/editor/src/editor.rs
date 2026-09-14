@@ -10873,6 +10873,7 @@ impl Editor {
     }
 
     pub fn handle_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.explanations.write_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.explanations.task = None;
         self.explanations.busy = false;
         self.explanations.last_view = None;

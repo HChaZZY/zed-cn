@@ -79,6 +79,7 @@ pub(crate) struct ExplanationState {
     pub syntax_version: usize,
     pub viewport: Option<(u32, u32)>,
     pub busy: bool,
+    pub write_generation: Arc<std::sync::atomic::AtomicU64>,
     pub bypass_cache: bool,
     pub cache_epoch: u64,
     pub memory: std::collections::HashMap<String, SharedString>,
@@ -109,6 +110,10 @@ pub(crate) fn content_hash(text: &str) -> String {
 }
 
 pub(crate) fn clear(editor: &mut Editor, cx: &mut Context<Editor>) {
+    editor
+        .explanations
+        .write_generation
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     editor.explanations.task = None;
     editor.explanations.busy = false;
     editor.explanations.version = None;
@@ -329,6 +334,8 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
     );
     let bypass_cache = editor.explanations.bypass_cache;
     let approved = editor.explanations.approved.clone();
+    let write_generation = editor.explanations.write_generation.clone();
+    let expected_write_generation = write_generation.load(std::sync::atomic::Ordering::SeqCst);
     let generation = editor.explanations.generation;
     editor.explanations.busy = true;
     editor.explanations.task = Some(cx.spawn(async move |this, cx| {
@@ -383,7 +390,6 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
                                                             &mut editor.explanations.blocks,
                                                         );
                                                         editor.remove_blocks(blocks, None, cx);
-                                                        editor.explanations.completed.clear();
                                                         editor
                                                             .explanations
                                                             .approved
@@ -460,26 +466,6 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
             } else {
                 None
             };
-            let allowed = cx.update(|cx| {
-                CodeExplanationSettings::get_global(cx).enabled
-                    && !project::DisableAiSettings::get_global(cx).disable_ai
-                    && format!("{:?}", CodeExplanationSettings::get_global(cx))
-                        == format!("{settings:?}")
-                    && buffer.read(cx).snapshot().version() == snapshot.version()
-                    && !buffer.read(cx).file().is_some_and(|file| file.is_private())
-                    && trust.update(cx, |trust, cx| trust.can_trust(&store, worktree_id, cx))
-            });
-            let same_provider = cx.update(|cx| {
-                content_hash(&format!(
-                    "{:?}",
-                    cx.global::<settings::SettingsStore>()
-                        .merged_settings()
-                        .language_models
-                )) == provider_configuration
-            });
-            if !allowed || !same_provider {
-                break;
-            }
             let cached = if !bypass_cache && cached.is_none() && settings.cache_persist {
                 let path = cache_path.clone();
                 let key = key.clone();
@@ -490,10 +476,37 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
             } else {
                 cached
             };
+            // Cache I/O and admission waits can outlive the authorization snapshot.
+            let authorized = |cx: &mut App| {
+                this.read_with(cx, |editor, cx| {
+                    editor.explanations.generation == generation
+                        && editor.project().is_some_and(|current| current == &project)
+                        && editor.buffer.read(cx).as_singleton().as_ref() == Some(&buffer)
+                })
+                .unwrap_or(false)
+                    && CodeExplanationSettings::get_global(cx).enabled
+                    && !project::DisableAiSettings::get_global(cx).disable_ai
+                    && format!("{:?}", CodeExplanationSettings::get_global(cx))
+                        == format!("{settings:?}")
+                    && content_hash(&format!(
+                        "{:?}",
+                        cx.global::<settings::SettingsStore>()
+                            .merged_settings()
+                            .language_models
+                    )) == provider_configuration
+                    && buffer.read(cx).snapshot().version() == snapshot.version()
+                    && buffer.read(cx).file().zip(snapshot.file()).is_some_and(
+                        |(current, original)| {
+                            Arc::ptr_eq(current, original) && !current.is_private()
+                        },
+                    )
+                    && trust.update(cx, |trust, cx| trust.can_trust(&store, worktree_id, cx))
+            };
             let result = match cached {
                 Some(text) => Ok(text.into()),
                 None => {
-                    request(
+                    request_if_authorized(
+                        authorized,
                         model.clone(),
                         settings.clone(),
                         format!(
@@ -510,22 +523,7 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
                     .await
                 }
             };
-            let still_current = cx.update(|cx| {
-                !project::DisableAiSettings::get_global(cx).disable_ai
-                    && format!("{:?}", CodeExplanationSettings::get_global(cx))
-                        == format!("{settings:?}")
-                    && buffer.read(cx).snapshot().version() == snapshot.version()
-                    && trust.update(cx, |trust, cx| trust.can_trust(&store, worktree_id, cx))
-            });
-            let same_provider = cx.update(|cx| {
-                content_hash(&format!(
-                    "{:?}",
-                    cx.global::<settings::SettingsStore>()
-                        .merged_settings()
-                        .language_models
-                )) == provider_configuration
-            });
-            if !still_current || !same_provider {
+            if !cx.update(authorized) {
                 break;
             }
             let result = result.and_then(|text| {
@@ -539,9 +537,14 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
                 let text = text.to_string();
                 let key = key.clone();
                 let budget = settings.cache_max_bytes;
+                let write_generation = write_generation.clone();
                 if let Err(error) = cx
                     .background_spawn(async move {
-                        cache_access(&cache_path, &key, Some(&text), budget)
+                        cache_access_guarded(&cache_path, &key, Some(&text), budget, || {
+                            write_generation.load(std::sync::atomic::Ordering::SeqCst)
+                                == expected_write_generation
+                                && CACHE_EPOCH.load(std::sync::atomic::Ordering::SeqCst) == epoch
+                        })
                     })
                     .await
                 {
@@ -549,6 +552,9 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
                 }
             }
             drop(permit);
+            if !cx.update(authorized) {
+                break;
+            }
             let text = result.unwrap_or_else(|error| format!("AI · 讲解失败：{error}").into());
             if this
                 .update(cx, |editor, cx| {
@@ -612,10 +618,23 @@ fn cache_access(
     value: Option<&str>,
     budget: u64,
 ) -> Result<Option<String>> {
+    cache_access_guarded(path, key, value, budget, || true)
+}
+
+fn cache_access_guarded(
+    path: &std::path::Path,
+    key: &str,
+    value: Option<&str>,
+    budget: u64,
+    authorized: impl FnOnce() -> bool,
+) -> Result<Option<String>> {
     use db::sqlez::{connection::Connection, statement::Statement};
     let _guard = CACHE_LOCK
         .lock()
         .map_err(|_| anyhow::anyhow!("讲解缓存锁不可用"))?;
+    if !authorized() {
+        return Ok(None);
+    }
     std::fs::create_dir_all(path.parent().context("缓存路径无效")?)?;
     let connection = Connection::open_file(path.to_str().context("缓存路径编码无效")?);
     anyhow::ensure!(connection.persistent(), "无法打开持久缓存，当前仅使用内存");
@@ -746,16 +765,63 @@ mod tests {
         crate::editor_tests::init_test(cx, |_| {});
         cx.update(|cx| {
             cx.update_global::<settings::SettingsStore, _>(|store, cx| {
-                store.set_user_settings(r#"{"disable_ai":true,"code_explanations":{"enabled":true}}"#, cx).unwrap();
+                store
+                    .set_user_settings(
+                        r#"{"disable_ai":true,"code_explanations":{"enabled":true}}"#,
+                        cx,
+                    )
+                    .unwrap();
             });
         });
         let model = Arc::new(FakeLanguageModel::default());
-        let provider = Arc::new(FakeLanguageModelProvider::default().with_models(vec![model.clone()]));
-        let configured = ConfiguredModel { provider, model: model.clone() };
+        let provider =
+            Arc::new(FakeLanguageModelProvider::default().with_models(vec![model.clone()]));
+        let configured = ConfiguredModel {
+            provider,
+            model: model.clone(),
+        };
         let task = cx.spawn(async move |mut cx| {
             let settings = cx.update(|cx| CodeExplanationSettings::get_global(cx).clone());
             request(configured, settings, "secret source".into(), &mut cx).await
         });
+        assert!(task.await.is_err());
+        assert!(model.pending_completions().is_empty());
+    }
+
+    #[gpui::test]
+    async fn revoked_authorization_after_cache_wait_never_calls_model(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use language_model::fake_provider::{FakeLanguageModel, FakeLanguageModelProvider};
+        crate::editor_tests::init_test(cx, |_| {});
+        let model = Arc::new(FakeLanguageModel::default());
+        let provider =
+            Arc::new(FakeLanguageModelProvider::default().with_models(vec![model.clone()]));
+        let configured = ConfiguredModel {
+            provider,
+            model: model.clone(),
+        };
+        let allowed = std::rc::Rc::new(std::cell::Cell::new(true));
+        let (resume, waiting) = futures::channel::oneshot::channel::<()>();
+        let task = cx.spawn({
+            let allowed = allowed.clone();
+            async move |mut cx| {
+                let settings = cx.update(|cx| CodeExplanationSettings::get_global(cx).clone());
+                assert!(allowed.get());
+                waiting.await.unwrap();
+                request_if_authorized(
+                    |_| allowed.get(),
+                    configured,
+                    settings,
+                    "private code".into(),
+                    &mut cx,
+                )
+                .await
+            }
+        });
+        cx.run_until_parked();
+        allowed.set(false);
+        resume.send(()).unwrap();
         assert!(task.await.is_err());
         assert!(model.pending_completions().is_empty());
     }
@@ -776,6 +842,14 @@ mod tests {
             Some("second")
         );
         assert_eq!(cache_access(&path, "a", None, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn cancelled_cache_write_does_not_create_database() {
+        let directory = util::test::TempTree::new(serde_json::json!({}));
+        let path = directory.path().join("cancelled.sqlite");
+        cache_access_guarded(&path, "key", Some("private explanation"), 100, || false).unwrap();
+        assert!(!path.exists());
     }
 
     #[test]
@@ -931,13 +1005,27 @@ impl workspace::StatusItemView for CodeExplanationIndicator {
     }
 }
 
+async fn request_if_authorized(
+    authorized: impl FnOnce(&mut App) -> bool,
+    model: ConfiguredModel,
+    settings: CodeExplanationSettings,
+    code: String,
+    cx: &mut gpui::AsyncApp,
+) -> Result<SharedString> {
+    anyhow::ensure!(cx.update(authorized), "讲解权限或代码已变化，未发送代码");
+    request(model, settings, code, cx).await
+}
+
 pub(crate) async fn request(
     model: ConfiguredModel,
     settings: CodeExplanationSettings,
     code: String,
     cx: &mut gpui::AsyncApp,
 ) -> Result<SharedString> {
-    anyhow::ensure!(!cx.update(|cx| project::DisableAiSettings::get_global(cx).disable_ai), "当前项目已禁用 AI，未发送代码");
+    anyhow::ensure!(
+        !cx.update(|cx| project::DisableAiSettings::get_global(cx).disable_ai),
+        "当前项目已禁用 AI，未发送代码"
+    );
     anyhow::ensure!(
         code.len() <= 64 * 1024,
         "代码单元超过单次讲解预算，需要按语法块拆分"
@@ -987,7 +1075,10 @@ pub(crate) async fn request(
         .await
         .context("讲解响应超时")?
     {
-        anyhow::ensure!(!cx.update(|cx| project::DisableAiSettings::get_global(cx).disable_ai), "当前项目已禁用 AI，已停止接收讲解");
+        anyhow::ensure!(
+            !cx.update(|cx| project::DisableAiSettings::get_global(cx).disable_ai),
+            "当前项目已禁用 AI，已停止接收讲解"
+        );
         chunks += 1;
         anyhow::ensure!(chunks <= 8192, "讲解响应过长");
         output.push_str(&chunk.map_err(|error| anyhow::anyhow!(error.to_string()))?);
