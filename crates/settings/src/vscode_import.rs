@@ -233,6 +233,7 @@ impl VsCodeSettings {
             theme: Box::new(self.theme_settings_content()),
             title_bar: None,
             hover_translation: None,
+            code_explanations: None,
             vim: None,
             vim_mode: None,
             workspace: self.workspace_settings_content(),

@@ -1119,6 +1119,22 @@ pub struct HoverTranslationSettingsContent {
     pub cache_max_bytes: Option<u64>,
 }
 
+#[with_fallible_options]
+#[derive(Clone, Default, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq, Eq)]
+pub struct CodeExplanationSettingsContent {
+    /// Automatically send visible code and its context to the selected AI service.
+    pub enabled: Option<bool>,
+    pub provider: Option<TranslationProviderSetting>,
+    pub model: Option<TranslationModelSetting>,
+    pub target_language: Option<String>,
+    /// Ask for confirmation above an individual function exceeding this many lines.
+    pub max_function_lines: Option<u64>,
+    pub detailed: Option<bool>,
+    pub prefer_existing_comments: Option<bool>,
+    pub cache_persist: Option<bool>,
+    pub cache_max_bytes: Option<u64>,
+}
+
 /// Whether to allow drag and drop text selection in buffer.
 #[with_fallible_options]
 #[derive(Clone, Default, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq, Eq)]
