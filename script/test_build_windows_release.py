@@ -160,7 +160,41 @@ subprocess.run(['git', '--git-dir', os.environ['FIXTURE_REMOTE'], 'update-ref',
         for name in ("bundle_linux", "bundle_macos", "bundle_windows", "build_static_bwrap"):
             self.assertTrue(JOBS[name]["continue-on-error"])
             self.assertFalse(JOBS[name]["strategy"]["fail-fast"])
-            self.assertEqual(len(JOBS[name]["strategy"]["matrix"]["include"]), 2)
+            expected_count = 1 if name == "bundle_macos" else 2
+            self.assertEqual(len(JOBS[name]["strategy"]["matrix"]["include"]), expected_count)
+
+    def test_macos_only_builds_apple_silicon(self):
+        self.assertEqual(JOBS["bundle_macos"]["strategy"]["matrix"]["include"], [
+            {"arch": "aarch64", "target": "aarch64-apple-darwin", "runner": "macos-15"},
+        ])
+
+    def test_asset_aggregation_excludes_retired_intel_macos_outputs(self):
+        step = next(step for step in JOBS["publish_release"]["steps"]
+                    if step.get("name") == "Validate available assets and generate checksums")
+        expected = {
+            "bwrap-linux-aarch64.gz", "bwrap-linux-x86_64.gz",
+            "Zed-aarch64.dmg", "Zed-aarch64.exe", "Zed-x86_64.exe",
+            "zed-linux-aarch64.tar.gz", "zed-linux-x86_64.tar.gz",
+            "zed-remote-server-linux-aarch64.gz", "zed-remote-server-linux-x86_64.gz",
+            "zed-remote-server-macos-aarch64.gz",
+            "zed-remote-server-windows-aarch64.zip", "zed-remote-server-windows-x86_64.zip",
+        }
+        directory = self.repository / "release-artifacts"
+        directory.mkdir()
+        for name in expected:
+            (directory / name).write_bytes(b"fixture")
+        result = self.shell(step["run"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((directory / "MISSING-ASSETS.txt").read_text(), "")
+        self.assertEqual(len((directory / "SHA256SUMS.txt").read_text().splitlines()), 12)
+        for name in ("MISSING-ASSETS.txt", "SHA256SUMS.txt"):
+            (directory / name).unlink()
+        for name in ("Zed-x86_64.dmg", "zed-remote-server-macos-x86_64.gz"):
+            (directory / name).write_bytes(b"retired")
+            result = self.shell(step["run"])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Unexpected release asset: " + name, result.stderr)
+            (directory / name).unlink()
 
 
 if __name__ == "__main__":
