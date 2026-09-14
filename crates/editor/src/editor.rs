@@ -16,6 +16,8 @@ pub mod blink_manager;
 mod bracket_colorization;
 mod clangd_ext;
 pub mod code_context_menus;
+mod code_explanation_units;
+pub mod code_explanations;
 mod code_lens;
 pub mod display_map;
 mod document_colors;
@@ -31,8 +33,6 @@ mod highlight_matching_bracket;
 pub mod hover_links;
 pub mod hover_popover;
 pub mod hover_translation;
-pub mod code_explanations;
-mod code_explanation_units;
 mod indent_guides;
 mod inlays;
 mod inline_input;
@@ -9930,7 +9930,7 @@ impl Editor {
                 source,
             } => {
                 if self.explanations.version.is_some() {
-                    code_explanations::clear(self, cx);
+                    code_explanations::code_edited(self);
                 }
                 self.scrollbar_marker_state.dirty = true;
                 self.active_indent_guides_state.dirty = true;
@@ -10873,11 +10873,7 @@ impl Editor {
     }
 
     pub fn handle_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.explanations.write_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.explanations.task = None;
-        self.explanations.busy = false;
-        self.explanations.last_view = None;
-        self.explanations.generation = self.explanations.generation.wrapping_add(1);
+        code_explanations::request_refresh(self);
         self.cursor_animations.clear();
         self.blink_manager.update(cx, BlinkManager::disable);
         self.buffer

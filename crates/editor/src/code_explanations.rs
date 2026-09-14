@@ -1,4 +1,4 @@
-use crate::code_explanation_units::{parse_annotations, units_at};
+use crate::code_explanation_units::{first_non_whitespace_column, parse_annotations, units_at};
 use crate::{BlockPlacement, BlockProperties, BlockStyle, Editor};
 use anyhow::{Context as _, Result};
 use collections::HashSet;
@@ -69,6 +69,8 @@ impl Settings for CodeExplanationSettings {
 pub(crate) struct ExplanationState {
     pub task: Option<Task<()>>,
     pub blocks: HashSet<crate::CustomBlockId>,
+    pub pending_blocks: Option<Vec<(multi_buffer::Anchor, SharedString)>>,
+    pub pending_version: Option<clock::Global>,
     pub generation: u64,
     pub last_view: Option<(u32, u32, clock::Global)>,
     pub completed: HashSet<std::ops::Range<usize>>,
@@ -79,6 +81,8 @@ pub(crate) struct ExplanationState {
     pub syntax_version: usize,
     pub viewport: Option<(u32, u32)>,
     pub busy: bool,
+    pub dirty: bool,
+    pub refresh_requested: bool,
     pub write_generation: Arc<std::sync::atomic::AtomicU64>,
     pub bypass_cache: bool,
     pub cache_epoch: u64,
@@ -109,6 +113,31 @@ pub(crate) fn content_hash(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
+pub(crate) fn code_edited(editor: &mut Editor) {
+    editor
+        .explanations
+        .write_generation
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    editor.explanations.task = None;
+    editor.explanations.busy = false;
+    editor.explanations.dirty = true;
+    editor.explanations.refresh_requested = false;
+    editor.explanations.generation = editor.explanations.generation.wrapping_add(1);
+    editor.explanations.last_view = None;
+    editor.explanations.completed.clear();
+    editor.explanations.approved.clear();
+    editor.explanations.prompted.clear();
+    editor.explanations.pending_blocks = None;
+    editor.explanations.pending_version = None;
+}
+
+pub(crate) fn request_refresh(editor: &mut Editor) {
+    if editor.explanations.dirty {
+        editor.explanations.refresh_requested = true;
+        editor.explanations.last_view = None;
+    }
+}
+
 pub(crate) fn clear(editor: &mut Editor, cx: &mut Context<Editor>) {
     editor
         .explanations
@@ -116,15 +145,44 @@ pub(crate) fn clear(editor: &mut Editor, cx: &mut Context<Editor>) {
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     editor.explanations.task = None;
     editor.explanations.busy = false;
+    editor.explanations.dirty = false;
+    editor.explanations.refresh_requested = false;
     editor.explanations.version = None;
     editor.explanations.generation = editor.explanations.generation.wrapping_add(1);
     editor.explanations.last_view = None;
     editor.explanations.completed.clear();
     editor.explanations.approved.clear();
     editor.explanations.prompted.clear();
+    editor.explanations.pending_blocks = None;
+    editor.explanations.pending_version = None;
     let blocks = std::mem::take(&mut editor.explanations.blocks);
     if !blocks.is_empty() {
         editor.remove_blocks(blocks, None, cx);
+    }
+}
+
+fn apply_pending(editor: &mut Editor, cx: &mut Context<Editor>) {
+    let pending_is_current = editor
+        .buffer
+        .read(cx)
+        .as_singleton()
+        .zip(editor.explanations.pending_version.as_ref())
+        .is_some_and(|(buffer, version)| buffer.read(cx).snapshot().version() == version);
+    if !pending_is_current {
+        editor.explanations.pending_blocks = None;
+        editor.explanations.pending_version = None;
+        return;
+    }
+    let Some(pending) = editor.explanations.pending_blocks.take() else {
+        return;
+    };
+    editor.explanations.pending_version = None;
+    let old_blocks = std::mem::take(&mut editor.explanations.blocks);
+    if !old_blocks.is_empty() {
+        editor.remove_blocks(old_blocks, None, cx);
+    }
+    for (anchor, text) in pending {
+        show(editor, anchor, text, cx);
     }
 }
 
@@ -181,12 +239,14 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
         }
         return;
     }
-    if !editor.is_focused(window) {
-        if editor.explanations.busy {
-            editor.explanations.task = None;
-            editor.explanations.busy = false;
-            editor.explanations.last_view = None;
-        }
+    let focused = editor.is_focused(window);
+    if focused && editor.explanations.pending_blocks.is_some() {
+        apply_pending(editor, cx);
+    }
+    if editor.explanations.dirty && !editor.explanations.refresh_requested {
+        return;
+    }
+    if !focused && !editor.explanations.refresh_requested && !editor.explanations.busy {
         return;
     }
     let provider_configuration = content_hash(&format!(
@@ -204,14 +264,6 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
         return;
     };
     let snapshot = buffer.read(cx).snapshot();
-    if editor
-        .explanations
-        .version
-        .as_ref()
-        .is_some_and(|version| version != snapshot.version())
-    {
-        clear(editor, cx);
-    }
     editor.explanations.version = Some(snapshot.version().clone());
     if editor.explanations.syntax_version != snapshot.syntax_update_count() {
         editor.explanations.syntax_version = snapshot.syntax_update_count();
@@ -309,12 +361,6 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
                 continue;
             }
             ranges.push(unit);
-            if ranges.len() == 2 {
-                break;
-            }
-        }
-        if ranges.len() == 2 {
-            break;
         }
     }
     if ranges.is_empty() {
@@ -333,12 +379,15 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
         project.read(cx).remote_connection_options(cx)
     );
     let bypass_cache = editor.explanations.bypass_cache;
+    let refresh_requested = editor.explanations.refresh_requested;
     let approved = editor.explanations.approved.clone();
     let write_generation = editor.explanations.write_generation.clone();
     let expected_write_generation = write_generation.load(std::sync::atomic::Ordering::SeqCst);
     let generation = editor.explanations.generation;
     editor.explanations.busy = true;
+    editor.explanations.refresh_requested = false;
     editor.explanations.task = Some(cx.spawn(async move |this, cx| {
+        let mut pending_blocks = Vec::new();
         cx.background_executor()
             .timer(std::time::Duration::from_millis(500))
             .await;
@@ -556,6 +605,31 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
                 break;
             }
             let text = result.unwrap_or_else(|error| format!("AI · 讲解失败：{error}").into());
+            let annotations = parse_annotations(
+                &text,
+                &code,
+                if settings.prefer_existing_comments {
+                    &unit.commented_rows
+                } else {
+                    &[]
+                },
+            );
+            if let Ok(annotations) = &annotations {
+                for annotation in annotations {
+                    let row = unit.first_row + annotation.line - 1;
+                    let column = code
+                        .lines()
+                        .nth(annotation.line - 1)
+                        .map(first_non_whitespace_column)
+                        .unwrap_or(0);
+                    let anchor = display
+                        .buffer_snapshot()
+                        .anchor_before(language::Point::new(row as u32, column as u32));
+                    pending_blocks.push((anchor, annotation.explanation.clone().into()));
+                }
+            } else if let Err(error) = &annotations {
+                pending_blocks.push((anchor, format!("AI · {error}").into()));
+            }
             if this
                 .update(cx, |editor, cx| {
                     if editor.explanations.generation == generation
@@ -568,26 +642,6 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
                         }
                         editor.explanations.memory.insert(key.clone(), text.clone());
                         editor.explanations.completed.insert(range);
-                        match parse_annotations(
-                            &text,
-                            &code,
-                            if settings.prefer_existing_comments {
-                                &unit.commented_rows
-                            } else {
-                                &[]
-                            },
-                        ) {
-                            Ok(annotations) => {
-                                for annotation in annotations {
-                                    let row = unit.first_row + annotation.line - 1;
-                                    let anchor = display
-                                        .buffer_snapshot()
-                                        .anchor_before(language::Point::new(row as u32, 0));
-                                    show(editor, anchor, annotation.explanation.into(), cx);
-                                }
-                            }
-                            Err(error) => show(editor, anchor, format!("AI · {error}").into(), cx),
-                        }
                     }
                 })
                 .is_err()
@@ -600,6 +654,16 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
             if editor.explanations.generation == generation {
                 editor.explanations.last_view = None;
                 editor.explanations.busy = false;
+                editor.explanations.bypass_cache = false;
+                if refresh_requested {
+                    editor.explanations.dirty = false;
+                    editor.explanations.pending_blocks = Some(pending_blocks);
+                    editor.explanations.pending_version = Some(snapshot.version().clone());
+                } else {
+                    for (anchor, text) in pending_blocks {
+                        show(editor, anchor, text, cx);
+                    }
+                }
                 cx.notify();
             }
         })

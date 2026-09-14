@@ -15,6 +15,12 @@ pub struct Unit {
     pub commented_rows: Vec<usize>,
 }
 
+pub fn first_non_whitespace_column(line: &str) -> usize {
+    line.char_indices()
+        .find_map(|(column, character)| (!character.is_whitespace()).then_some(column))
+        .unwrap_or(0)
+}
+
 fn function(node: tree_sitter::Node<'_>) -> bool {
     matches!(
         node.kind(),
@@ -31,17 +37,33 @@ fn function(node: tree_sitter::Node<'_>) -> bool {
 }
 
 pub fn units_at(snapshot: &language::BufferSnapshot, row: u32) -> Vec<Unit> {
-    let point = language::Point::new(row, 0);
+    let line_start = snapshot.point_to_offset(language::Point::new(row, 0));
+    let line_end = snapshot.point_to_offset(language::Point::new(row, snapshot.line_len(row)));
+    let line = snapshot
+        .text_for_range(line_start..line_end)
+        .collect::<String>();
+    let content_column = first_non_whitespace_column(&line);
+    if content_column == 0 && line.chars().next().is_none_or(char::is_whitespace) {
+        return Vec::new();
+    }
+    let content_offset = line_start + content_column;
+    let point = snapshot.offset_to_point(content_offset);
     let Some(mut node) = snapshot.syntax_ancestor(point..point) else {
         return Vec::new();
     };
     let mut owner = node;
-    while let Some(parent) = node.parent() {
+    loop {
         if function(node) {
             owner = node;
             break;
         }
-        owner = node;
+        let Some(parent) = node.parent() else {
+            break;
+        };
+        if parent.parent().is_none() {
+            break;
+        }
+        owner = parent;
         node = parent;
     }
     let owner_range = owner.byte_range();
@@ -184,6 +206,61 @@ mod tests {
             code.trim_end()
         );
         assert_eq!(units[0].owner_lines, 6);
+    }
+
+    #[gpui::test]
+    fn rows_select_the_enclosing_function_without_root_overlap(cx: &mut gpui::App) {
+        let code = "fn first() {\n    let value = 1;\n}\n\nfn second() {\n    let value = 2;\n}\n";
+        let snapshot = language::Buffer::build_snapshot_sync(
+            code.into(),
+            Some(language::rust_lang()),
+            None,
+            cx,
+        );
+
+        let first = units_at(&snapshot, 1);
+        let second = units_at(&snapshot, 5);
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            snapshot
+                .text_for_range(first[0].range.clone())
+                .collect::<String>(),
+            "fn first() {\n    let value = 1;\n}"
+        );
+        assert_eq!(
+            snapshot
+                .text_for_range(second[0].range.clone())
+                .collect::<String>(),
+            "fn second() {\n    let value = 2;\n}"
+        );
+        assert!(units_at(&snapshot, 3).is_empty());
+    }
+
+    #[test]
+    fn indentation_column_uses_the_first_code_byte() {
+        assert_eq!(first_non_whitespace_column("    value"), 4);
+        assert_eq!(first_non_whitespace_column("\t\tvalue"), 2);
+        assert_eq!(first_non_whitespace_column("  变量"), 2);
+        assert_eq!(first_non_whitespace_column(""), 0);
+        assert_eq!(first_non_whitespace_column("   "), 0);
+    }
+
+    #[gpui::test]
+    fn top_level_statements_are_separate_units(cx: &mut gpui::App) {
+        let code = "const FIRST: usize = 1;\nconst SECOND: usize = 2;\n";
+        let snapshot = language::Buffer::build_snapshot_sync(
+            code.into(),
+            Some(language::rust_lang()),
+            None,
+            cx,
+        );
+
+        let first = units_at(&snapshot, 0);
+        let second = units_at(&snapshot, 1);
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_ne!(first[0].range, second[0].range);
     }
 
     #[gpui::test]
