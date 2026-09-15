@@ -288,7 +288,8 @@ pub fn deploy_context_menu(
                     }),
                 )
                 .when(!disable_ai && has_selections, |this| {
-                    this.action("添加到Agent线程", Box::new(AddSelectionToThread))
+                    this.action("深入讲解选中代码", Box::new(crate::DeepExplainSelection))
+                        .action("添加到Agent线程", Box::new(AddSelectionToThread))
                 })
                 .separator()
                 .action("剪切", Box::new(Cut))

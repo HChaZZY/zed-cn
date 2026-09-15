@@ -79,7 +79,7 @@ mod rewrap;
 mod selection;
 
 pub(crate) use actions::*;
-pub use actions::{RunCode, RunFile, RunSelection, StopCode};
+pub use actions::{DeepExplainSelection, RunCode, RunFile, RunSelection, StopCode};
 pub use clipboard::ClipboardSelection;
 pub use code_actions::CodeActionProvider;
 use collections::TypeIdHashMap;
@@ -9930,7 +9930,7 @@ impl Editor {
                 source,
             } => {
                 if self.explanations.version.is_some() {
-                    code_explanations::code_edited(self);
+                    code_explanations::code_edited(self, cx);
                 }
                 self.scrollbar_marker_state.dirty = true;
                 self.active_indent_guides_state.dirty = true;

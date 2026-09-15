@@ -75,6 +75,10 @@ const CONTENT_GROUP_TAB_INDEX: isize = 5;
 const SIDEBAR_WIDTH: Pixels = px(226.);
 const CONTENT_MIN_WIDTH: Pixels = px(400.);
 
+fn is_llm_providers_page(json_path: Option<&str>) -> bool {
+    json_path == Some("llm_providers")
+}
+
 actions!(
     settings_editor,
     [
@@ -3880,8 +3884,7 @@ impl SettingsWindow {
         if let Some(current_sub_page) = self.sub_page_stack.last() {
             let is_skills_page =
                 current_sub_page.link.json_path == Some(AGENT_SKILLS_SETTINGS_PATH);
-            let is_llm_providers_page = current_sub_page.link.json_path == Some("llm_providers")
-                && current_sub_page.link.title.as_ref() == "LLM Providers";
+            let is_llm_providers_page = is_llm_providers_page(current_sub_page.link.json_path);
             let is_external_agents_page = current_sub_page.link.json_path == Some("agent_servers");
             let is_mcp_servers_page = current_sub_page.link.json_path == Some("context_servers");
 
@@ -5679,6 +5682,13 @@ pub mod test {
                 skill_creator_page: None,
             }
         }
+    }
+
+    #[test]
+    fn localized_llm_providers_page_keeps_add_button() {
+        assert!(is_llm_providers_page(Some("llm_providers")));
+        assert!(!is_llm_providers_page(Some("agent_servers")));
+        assert!(!is_llm_providers_page(None));
     }
 
     #[test]
