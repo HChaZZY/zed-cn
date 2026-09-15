@@ -1,5 +1,12 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
+use anyhow::Context as _;
 use editor::Editor;
 use gpui::{AnyView, Entity, Focusable as _, ScrollHandle, prelude::*};
 use language_model::{
@@ -521,12 +528,16 @@ fn get_or_create_configuration_view(
     view
 }
 
+static NEXT_LLM_PROVIDER_FORM_ID: AtomicU64 = AtomicU64::new(1);
+
 pub(crate) struct LlmProviderForm {
+    id: u64,
     kind: CompatibleProviderKind,
     provider_name: Entity<Editor>,
     api_url: Entity<Editor>,
     api_key: Entity<Editor>,
     models: Vec<ModelInput>,
+    is_fetching_models: bool,
     error: Option<SharedString>,
 }
 
@@ -537,6 +548,7 @@ impl LlmProviderForm {
         cx: &mut Context<SettingsWindow>,
     ) -> Self {
         Self {
+            id: NEXT_LLM_PROVIDER_FORM_ID.fetch_add(1, Ordering::Relaxed),
             kind,
             provider_name: new_input(kind.label(), None, false, window, cx),
             api_url: new_input(kind.default_api_url(), None, false, window, cx),
@@ -547,7 +559,8 @@ impl LlmProviderForm {
                 window,
                 cx,
             ),
-            models: vec![ModelInput::new(0, window, cx)],
+            models: Vec::new(),
+            is_fetching_models: false,
             error: None,
         }
     }
@@ -602,6 +615,31 @@ impl ModelInput {
             interleaved_reasoning: interleaved_reasoning.into(),
             max_tokens_parameter: max_tokens_parameter.into(),
         }
+    }
+
+    fn from_discovered(
+        index: usize,
+        model: DiscoveredModel,
+        window: &mut Window,
+        cx: &mut Context<SettingsWindow>,
+    ) -> Self {
+        let mut input = Self::new(index, window, cx);
+        input.name.update(cx, |editor, cx| {
+            editor.set_text(model.name, window, cx);
+        });
+        input.max_completion_tokens.update(cx, |editor, cx| {
+            editor.set_text(model.max_tokens.to_string(), window, cx);
+        });
+        input.max_output_tokens.update(cx, |editor, cx| {
+            editor.set_text(model.max_output_tokens.to_string(), window, cx);
+        });
+        input.max_tokens.update(cx, |editor, cx| {
+            editor.set_text(model.max_tokens.to_string(), window, cx);
+        });
+        input.supports_tools = model.supports_tools.into();
+        input.supports_images = model.supports_images.into();
+        input.supports_thinking = model.supports_thinking.into();
+        input
     }
 }
 
@@ -756,30 +794,183 @@ fn render_models_section(
     window: &mut Window,
     cx: &mut Context<SettingsWindow>,
 ) -> impl IntoElement {
+    let fetch_label = if form.is_fetching_models {
+        "正在获取…"
+    } else {
+        "自动获取"
+    };
+
     v_flex()
         .mt_1()
         .gap_2()
         .child(
+            Label::new(
+                "填写 API URL 和 API Key 后，优先自动获取模型；若接口不支持模型列表，再手动添加。",
+            )
+            .size(LabelSize::Small)
+            .color(Color::Muted),
+        )
+        .child(
             h_flex().justify_between().child(Label::new("模型")).child(
-                Button::new("add-model", "添加模型")
-                    .start_icon(
-                        Icon::new(IconName::Plus)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("fetch-models", fetch_label)
+                            .start_icon(
+                                Icon::new(IconName::ArrowCircle)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .label_size(LabelSize::Small)
+                            .disabled(form.is_fetching_models)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                fetch_llm_provider_models(this, window, cx);
+                            })),
                     )
-                    .label_size(LabelSize::Small)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        if let Some(form) = this.llm_provider_form.as_mut() {
-                            let index = form.models.len();
-                            form.models.push(ModelInput::new(index, window, cx));
-                        }
-                        cx.notify();
-                    })),
+                    .child(
+                        Button::new("add-model", "添加模型")
+                            .start_icon(
+                                Icon::new(IconName::Plus)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if let Some(form) = this.llm_provider_form.as_mut() {
+                                    let index = form.models.len();
+                                    form.models.push(ModelInput::new(index, window, cx));
+                                }
+                                cx.notify();
+                            })),
+                    ),
             ),
         )
         .children(form.models.iter().enumerate().map(|(index, model)| {
             render_model(form.kind, model, index, form.models.len(), window, cx)
         }))
+}
+
+fn fetch_llm_provider_models(
+    settings_window: &mut SettingsWindow,
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) {
+    let Some(form) = settings_window.llm_provider_form.as_mut() else {
+        return;
+    };
+    if form.is_fetching_models {
+        return;
+    }
+
+    let form_id = form.id;
+    let kind = form.kind;
+    let api_url = form.api_url.read(cx).text(cx);
+    let api_key = form.api_key.read(cx).text(cx);
+    if api_url.trim().is_empty() || api_key.trim().is_empty() {
+        form.error = Some("请先填写 API URL 和 API Key".into());
+        cx.notify();
+        return;
+    }
+
+    form.is_fetching_models = true;
+    form.error = None;
+    cx.notify();
+
+    let api_url = api_url.trim().trim_end_matches('/').to_string();
+    let api_key = api_key.trim().to_string();
+    let http_client = cx.http_client();
+    cx.spawn_in(window, async move |this, cx| {
+        let result = match kind {
+            CompatibleProviderKind::OpenAi => lmstudio::get_models(
+                http_client.as_ref(),
+                &api_url,
+                Some(&api_key),
+                None,
+                &Default::default(),
+            )
+            .await
+            .context("无法从 OpenAI 兼容接口获取模型")
+            .map(|models| {
+                models
+                    .into_iter()
+                    .filter(|model| model.r#type != lmstudio::ModelType::Embeddings)
+                    .map(|model| DiscoveredModel {
+                        name: model.id,
+                        max_tokens: model
+                            .loaded_context_length
+                            .or(model.max_context_length)
+                            .unwrap_or(200_000),
+                        max_output_tokens: 32_000,
+                        supports_tools: model.capabilities.is_empty()
+                            || model.capabilities.supports_tool_calls(),
+                        supports_images: model.capabilities.supports_images()
+                            || model.r#type == lmstudio::ModelType::Vlm,
+                        supports_thinking: false,
+                    })
+                    .collect::<Vec<_>>()
+            }),
+            CompatibleProviderKind::Anthropic => anthropic::list_models(
+                http_client.as_ref(),
+                &api_url,
+                &api_key,
+                &Default::default(),
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("{error:?}"))
+            .context("无法从 Anthropic 兼容接口获取模型")
+            .map(|models| {
+                models
+                    .into_iter()
+                    .map(|model| DiscoveredModel {
+                        name: model.id,
+                        max_tokens: model.max_input_tokens,
+                        max_output_tokens: model.max_output_tokens,
+                        supports_tools: true,
+                        supports_images: model.supports_images,
+                        supports_thinking: model.supports_thinking,
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        };
+
+        this.update_in(cx, |this, window, cx| {
+            let Some(form) = this.llm_provider_form.as_mut() else {
+                return;
+            };
+            if form.id != form_id {
+                return;
+            }
+            form.is_fetching_models = false;
+            match result {
+                Ok(models) if models.is_empty() => {
+                    form.error = Some("接口未返回可用模型，请手动添加".into());
+                }
+                Ok(models) => {
+                    form.models = models
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, model)| ModelInput::from_discovered(index, model, window, cx))
+                        .collect();
+                    form.error = None;
+                }
+                Err(error) => {
+                    form.error = Some(format!("自动获取失败：{error:#}").into());
+                }
+            }
+            cx.notify();
+        })?;
+        anyhow::Ok(())
+    })
+    .detach_and_log_err(cx);
+}
+
+struct DiscoveredModel {
+    name: String,
+    max_tokens: u64,
+    max_output_tokens: u64,
+    supports_tools: bool,
+    supports_images: bool,
+    supports_thinking: bool,
 }
 
 fn render_model(
@@ -1219,6 +1410,10 @@ fn validate_llm_provider_form(
     let api_key = values.api_key.clone();
     if api_key.is_empty() {
         return Err("API Key cannot be empty".into());
+    }
+
+    if values.models.is_empty() {
+        return Err("请先自动获取或手动添加至少一个模型".into());
     }
 
     let models = match values.kind {
