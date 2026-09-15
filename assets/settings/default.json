@@ -625,6 +625,8 @@
     "model": null,
     "target_language": "中文",
     "max_function_lines": 500,
+    "max_concurrent_requests": 5,
+    "preload_lines": 100,
     "detailed": false,
     "prefer_existing_comments": true,
     "cache_persist": true,

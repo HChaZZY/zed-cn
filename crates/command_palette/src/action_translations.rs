@@ -260,6 +260,7 @@ pub fn translate_action_name(name: &str) -> Option<&'static str> {
         "editor::RunFile" => Some("编辑器: 运行当前文件"),
         "editor::RunCode" => Some("编辑器: 运行代码"),
         "editor::RunSelection" => Some("编辑器: 运行选中代码"),
+        "editor::DeepExplainSelection" => Some("编辑器: 深入讲解选中代码"),
         "editor::StopCode" => Some("编辑器: 停止运行代码"),
         "editor::SplitSelectionIntoLines" => Some("编辑器: 将选区拆分为多行"),
         "editor::StopLanguageServer" => Some("编辑器: 停止语言服务器"),

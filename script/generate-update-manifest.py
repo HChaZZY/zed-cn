@@ -5,6 +5,8 @@ import argparse
 import json
 import re
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 REPOSITORY = "rxp200/zed-cn"
@@ -17,7 +19,16 @@ ASSETS = {
 
 
 def command(*arguments):
-    return subprocess.check_output(arguments, text=True)
+    for attempt in range(4):
+        try:
+            return subprocess.check_output(arguments, text=True, timeout=120)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            if attempt == 3:
+                raise
+            delay = 2 ** (attempt + 1)
+            print(f"GitHub request failed ({error}); retry {attempt + 1}/3 in {delay}s",
+                  file=sys.stderr)
+            time.sleep(delay)
 
 
 def resolve_tag_commit(tag):
@@ -102,22 +113,27 @@ def build_manifest(releases, load_metadata):
         # This marker is uploaded last, after all binaries and checksums succeed.
         if "update-metadata.json" not in uploaded:
             continue
-        metadata = validate_release(load_metadata(release["tag_name"]))
-        if metadata["tag_name"] != release["tag_name"]:
-            raise ValueError("Metadata tag mismatch")
-        if metadata["draft"] or metadata["prerelease"]:
-            raise ValueError("Unexpected unpublished metadata")
-        if resolve_tag_commit(release["tag_name"]) != metadata["target_commitish"]:
-            raise ValueError("Metadata source commit differs from release tag")
-        if not metadata["assets"]:
+        try:
+            metadata = validate_release(load_metadata(release["tag_name"]))
+            if metadata["tag_name"] != release["tag_name"]:
+                raise ValueError("Metadata tag mismatch")
+            if metadata["draft"] or metadata["prerelease"]:
+                raise ValueError("Unexpected unpublished metadata")
+            if resolve_tag_commit(release["tag_name"]) != metadata["target_commitish"]:
+                raise ValueError("Metadata source commit differs from release tag")
+            if not metadata["assets"]:
+                continue
+            for asset in metadata["assets"]:
+                actual = uploaded.get(asset["name"])
+                if actual is None or actual["size"] != asset["size"] or actual["browser_download_url"] != asset["browser_download_url"]:
+                    raise ValueError("Release asset differs from completed metadata")
+                digest = actual.get("digest")
+                if digest and digest != f"sha256:{asset['sha256']}":
+                    raise ValueError("Release asset digest differs from completed metadata")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                ValueError, KeyError, TypeError) as error:
+            print(f"WARNING: Skipping {release['tag_name']}: {error}", file=sys.stderr)
             continue
-        for asset in metadata["assets"]:
-            actual = uploaded.get(asset["name"])
-            if actual is None or actual["size"] != asset["size"] or actual["browser_download_url"] != asset["browser_download_url"]:
-                raise ValueError("Release asset differs from completed metadata")
-            digest = actual.get("digest")
-            if digest and digest != f"sha256:{asset['sha256']}":
-                raise ValueError("Release asset digest differs from completed metadata")
         result.append(metadata)
     result.sort(key=lambda item: tuple(map(int, TAG.fullmatch(item["tag_name"]).groups())), reverse=True)
     if not result:

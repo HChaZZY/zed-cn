@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
 pub const MAX_INPUT_BYTES: usize = 20 * 1024;
+pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unit {
@@ -34,6 +35,32 @@ fn function(node: tree_sitter::Node<'_>) -> bool {
             | "local_function"
             | "function"
     )
+}
+
+pub fn whole_file_unit(snapshot: &language::BufferSnapshot, maximum_lines: u64) -> Option<Unit> {
+    let line_count = snapshot.max_point().row as u64 + 1;
+    if line_count > maximum_lines || snapshot.len() > MAX_REQUEST_BYTES {
+        return None;
+    }
+    let range = 0..snapshot.len();
+    let commented_rows = snapshot
+        .text()
+        .lines()
+        .enumerate()
+        .filter_map(|(row, line)| {
+            let line = line.trim_start();
+            (line.starts_with("//") || line.starts_with('#')).then_some(row)
+        })
+        .collect();
+    Some(Unit {
+        range: range.clone(),
+        owner: range,
+        owner_lines: line_count as usize,
+        first_row: 0,
+        last_row: snapshot.max_point().row as usize,
+        context: String::new(),
+        commented_rows,
+    })
 }
 
 pub fn units_at(snapshot: &language::BufferSnapshot, row: u32) -> Vec<Unit> {
@@ -188,6 +215,27 @@ pub fn parse_annotations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[gpui::test]
+    fn whole_file_is_used_only_within_line_and_request_budgets(cx: &mut gpui::App) {
+        let snapshot = language::Buffer::build_snapshot_sync(
+            "const FIRST: usize = 1;\nconst SECOND: usize = 2;\n".into(),
+            Some(language::rust_lang()),
+            None,
+            cx,
+        );
+        let unit = whole_file_unit(&snapshot, 500).unwrap();
+        assert_eq!(unit.range, 0..snapshot.len());
+        assert!(whole_file_unit(&snapshot, 1).is_none());
+
+        let oversized = language::Buffer::build_snapshot_sync(
+            "x".repeat(MAX_REQUEST_BYTES + 1).into(),
+            Some(language::rust_lang()),
+            None,
+            cx,
+        );
+        assert!(whole_file_unit(&oversized, 500).is_none());
+    }
+
     #[gpui::test]
     fn function_units_preserve_multiline_statements(cx: &mut gpui::App) {
         let code = "fn example() {\n let result = call(\n  1,\n  2,\n );\n}\n";

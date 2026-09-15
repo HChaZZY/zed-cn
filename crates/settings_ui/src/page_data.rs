@@ -8785,56 +8785,110 @@ fn collaboration_page() -> SettingsPage {
     }
 }
 
-fn code_explanations_section() -> [SettingsPageItem; 10] {
+fn code_explanations_section() -> [SettingsPageItem; 12] {
     [
         SettingsPageItem::SectionHeader("代码讲解"),
         SettingsPageItem::SettingItem(SettingItem {
-            title: "讲解语言", description: "代码讲解的输出语言，默认中文。",
+            title: "讲解语言",
+            description: "代码讲解的输出语言，默认中文。",
             field: Box::new(SettingField {
-                organization_override: None, json_path: Some("code_explanations.target_language"),
+                organization_override: None,
+                json_path: Some("code_explanations.target_language"),
                 pick: |content| content.code_explanations.as_ref()?.target_language.as_ref(),
-                write: |content, value, _| content.code_explanations.get_or_insert_default().target_language = value,
-            }), metadata: None, files: USER,
+                write: |content, value, _| {
+                    content
+                        .code_explanations
+                        .get_or_insert_default()
+                        .target_language = value
+                },
+            }),
+            metadata: None,
+            files: USER,
         }),
         SettingsPageItem::SettingItem(SettingItem {
-            title: "讲解渠道", description: "代码仅发送给明确选择的渠道，不自动回退到其他服务。",
+            title: "讲解渠道",
+            description: "代码仅发送给明确选择的渠道，不自动回退到其他服务。",
             field: Box::new(SettingField {
-                organization_override: None, json_path: Some("code_explanations.provider"),
+                organization_override: None,
+                json_path: Some("code_explanations.provider"),
                 pick: |content| content.code_explanations.as_ref()?.provider.as_ref(),
-                write: |content, value, _| content.code_explanations.get_or_insert_default().provider = value,
-            }), metadata: None, files: USER,
+                write: |content, value, _| {
+                    content.code_explanations.get_or_insert_default().provider = value
+                },
+            }),
+            metadata: None,
+            files: USER,
         }),
         SettingsPageItem::SettingItem(SettingItem {
-            title: "讲解模型", description: "用于代码讲解的模型。",
+            title: "讲解模型",
+            description: "用于代码讲解的模型。",
             field: Box::new(SettingField {
-                organization_override: None, json_path: Some("code_explanations.model"),
+                organization_override: None,
+                json_path: Some("code_explanations.model"),
                 pick: |content| content.code_explanations.as_ref()?.model.as_ref(),
-                write: |content, value, _| content.code_explanations.get_or_insert_default().model = value,
-            }), metadata: None, files: USER,
+                write: |content, value, _| {
+                    content.code_explanations.get_or_insert_default().model = value
+                },
+            }),
+            metadata: None,
+            files: USER,
         }),
         SettingsPageItem::SettingItem(SettingItem {
-            title: "原有注释优先", description: "跳过已有注释说明的语法单元。",
+            title: "原有注释优先",
+            description: "跳过已有注释说明的语法单元。",
             field: Box::new(SettingField {
-                organization_override: None, json_path: Some("code_explanations.prefer_existing_comments"),
-                pick: |content| content.code_explanations.as_ref()?.prefer_existing_comments.as_ref(),
-                write: |content, value, _| content.code_explanations.get_or_insert_default().prefer_existing_comments = value,
-            }), metadata: None, files: USER,
+                organization_override: None,
+                json_path: Some("code_explanations.prefer_existing_comments"),
+                pick: |content| {
+                    content
+                        .code_explanations
+                        .as_ref()?
+                        .prefer_existing_comments
+                        .as_ref()
+                },
+                write: |content, value, _| {
+                    content
+                        .code_explanations
+                        .get_or_insert_default()
+                        .prefer_existing_comments = value
+                },
+            }),
+            metadata: None,
+            files: USER,
         }),
         SettingsPageItem::SettingItem(SettingItem {
-            title: "持久缓存", description: "将讲解保存至本机 SQLite 数据库，不写入项目目录。讲解可能包含敏感代码信息。",
+            title: "持久缓存",
+            description: "将讲解保存至本机 SQLite 数据库，不写入项目目录。讲解可能包含敏感代码信息。",
             field: Box::new(SettingField {
-                organization_override: None, json_path: Some("code_explanations.cache_persist"),
+                organization_override: None,
+                json_path: Some("code_explanations.cache_persist"),
                 pick: |content| content.code_explanations.as_ref()?.cache_persist.as_ref(),
-                write: |content, value, _| content.code_explanations.get_or_insert_default().cache_persist = value,
-            }), metadata: None, files: USER,
+                write: |content, value, _| {
+                    content
+                        .code_explanations
+                        .get_or_insert_default()
+                        .cache_persist = value
+                },
+            }),
+            metadata: None,
+            files: USER,
         }),
         SettingsPageItem::SettingItem(SettingItem {
-            title: "项目缓存字节上限", description: "每项目讲解内容的缓存预算，默认 50 MiB。",
+            title: "项目缓存字节上限",
+            description: "每项目讲解内容的缓存预算，默认 50 MiB。",
             field: Box::new(SettingField {
-                organization_override: None, json_path: Some("code_explanations.cache_max_bytes"),
+                organization_override: None,
+                json_path: Some("code_explanations.cache_max_bytes"),
                 pick: |content| content.code_explanations.as_ref()?.cache_max_bytes.as_ref(),
-                write: |content, value, _| content.code_explanations.get_or_insert_default().cache_max_bytes = value,
-            }), metadata: None, files: USER,
+                write: |content, value, _| {
+                    content
+                        .code_explanations
+                        .get_or_insert_default()
+                        .cache_max_bytes = value
+                },
+            }),
+            metadata: None,
+            files: USER,
         }),
         SettingsPageItem::SettingItem(SettingItem {
             title: "启用代码讲解",
@@ -8843,31 +8897,86 @@ fn code_explanations_section() -> [SettingsPageItem; 10] {
                 organization_override: None,
                 json_path: Some("code_explanations.enabled"),
                 pick: |content| content.code_explanations.as_ref()?.enabled.as_ref(),
-                write: |content, value, _| content.code_explanations.get_or_insert_default().enabled = value,
+                write: |content, value, _| {
+                    content.code_explanations.get_or_insert_default().enabled = value
+                },
             }),
             metadata: None,
             files: USER,
         }),
         SettingsPageItem::SettingItem(SettingItem {
-            title: "函数自动讲解行数上限",
-            description: "只限制单个函数，不限制文件大小。超过此行数时，在函数上方询问是否继续讲解。",
+            title: "整文件讲解行数上限",
+            description: "文件不超过此行数且单次请求不超过 64 KiB 时整体讲解；否则按函数或顶层语法单元拆分。超长函数仍会单独询问。",
             field: Box::new(SettingField {
                 organization_override: None,
                 json_path: Some("code_explanations.max_function_lines"),
-                pick: |content| content.code_explanations.as_ref()?.max_function_lines.as_ref(),
-                write: |content, value, _| content.code_explanations.get_or_insert_default().max_function_lines = value,
+                pick: |content| {
+                    content
+                        .code_explanations
+                        .as_ref()?
+                        .max_function_lines
+                        .as_ref()
+                },
+                write: |content, value, _| {
+                    content
+                        .code_explanations
+                        .get_or_insert_default()
+                        .max_function_lines = value
+                },
+            }),
+            metadata: None,
+            files: USER,
+        }),
+        SettingsPageItem::SettingItem(SettingItem {
+            title: "最大并发请求数",
+            description: "同时执行的代码讲解请求数量，默认及最大值为 5。",
+            field: Box::new(SettingField {
+                organization_override: None,
+                json_path: Some("code_explanations.max_concurrent_requests"),
+                pick: |content| {
+                    content
+                        .code_explanations
+                        .as_ref()?
+                        .max_concurrent_requests
+                        .as_ref()
+                },
+                write: |content, value, _| {
+                    content
+                        .code_explanations
+                        .get_or_insert_default()
+                        .max_concurrent_requests = value
+                },
+            }),
+            metadata: None,
+            files: USER,
+        }),
+        SettingsPageItem::SettingItem(SettingItem {
+            title: "预加载行数",
+            description: "除可见区域外，提前讲解视口上方和下方各多少行，默认各 100 行。",
+            field: Box::new(SettingField {
+                organization_override: None,
+                json_path: Some("code_explanations.preload_lines"),
+                pick: |content| content.code_explanations.as_ref()?.preload_lines.as_ref(),
+                write: |content, value, _| {
+                    content
+                        .code_explanations
+                        .get_or_insert_default()
+                        .preload_lines = value
+                },
             }),
             metadata: None,
             files: USER,
         }),
         SettingsPageItem::SettingItem(SettingItem {
             title: "详细讲解",
-            description: "补充语句、参数及语法说明；关闭时按逻辑步骤讲解。",
+            description: "自动讲解补充语句、参数及语法说明；选区的单独深度讲解始终使用语法级深度。",
             field: Box::new(SettingField {
                 organization_override: None,
                 json_path: Some("code_explanations.detailed"),
                 pick: |content| content.code_explanations.as_ref()?.detailed.as_ref(),
-                write: |content, value, _| content.code_explanations.get_or_insert_default().detailed = value,
+                write: |content, value, _| {
+                    content.code_explanations.get_or_insert_default().detailed = value
+                },
             }),
             metadata: None,
             files: USER,

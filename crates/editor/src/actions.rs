@@ -925,6 +925,9 @@ actions!(
         ToggleSoftWrap,
         /// Toggles the tab bar display.
         ToggleTabBar,
+        /// Generates a syntax-level explanation for the selected code and adds
+        /// a line-end control that opens the explanation in a modal.
+        DeepExplainSelection,
         /// Translates the selected text, or the word under the cursor when
         /// nothing is selected, using the model configured under
         /// `hover_translation` in settings.

@@ -1127,8 +1127,13 @@ pub struct CodeExplanationSettingsContent {
     pub provider: Option<TranslationProviderSetting>,
     pub model: Option<TranslationModelSetting>,
     pub target_language: Option<String>,
-    /// Ask for confirmation above an individual function exceeding this many lines.
+    /// Explain a file as one request within this line count; larger files are split by syntax.
+    /// Individual functions over the same threshold still require confirmation.
     pub max_function_lines: Option<u64>,
+    /// Maximum number of code explanation model requests running at once.
+    pub max_concurrent_requests: Option<u64>,
+    /// Number of buffer lines to preload above and below the visible viewport.
+    pub preload_lines: Option<u64>,
     pub detailed: Option<bool>,
     pub prefer_existing_comments: Option<bool>,
     pub cache_persist: Option<bool>,

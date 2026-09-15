@@ -308,6 +308,11 @@ impl EditorElement {
             window,
             crate::hover_translation::translate_selection,
         );
+        register_action(
+            editor,
+            window,
+            crate::code_explanations::deep_explain_selection,
+        );
         register_action(editor, window, Editor::next_snippet_tabstop);
         register_action(editor, window, Editor::previous_snippet_tabstop);
         register_action(editor, window, Editor::copy);
