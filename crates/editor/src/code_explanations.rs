@@ -445,6 +445,7 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
             }
         }
     }
+    retain_pending_units(&mut ranges, &editor.explanations.completed);
     if ranges.is_empty() {
         return;
     }
@@ -759,6 +760,13 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
     }));
 }
 
+fn retain_pending_units(
+    units: &mut Vec<crate::code_explanation_units::Unit>,
+    completed: &HashSet<std::ops::Range<usize>>,
+) {
+    units.retain(|unit| !completed.contains(&unit.range));
+}
+
 fn cache_access(
     path: &std::path::Path,
     key: &str,
@@ -997,6 +1005,33 @@ mod tests {
         let path = directory.path().join("cancelled.sqlite");
         cache_access_guarded(&path, "key", Some("private explanation"), 100, || false).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn completed_whole_file_units_are_not_scheduled_again() {
+        let mut completed = HashSet::default();
+        let unit = || crate::code_explanation_units::Unit {
+            range: 0..100,
+            owner: 0..100,
+            owner_lines: 5,
+            first_row: 0,
+            last_row: 4,
+            context: String::new(),
+            commented_rows: Vec::new(),
+        };
+        let mut units = vec![unit()];
+        retain_pending_units(&mut units, &completed);
+        assert_eq!(units.len(), 1);
+        completed.insert(0..100);
+        for _ in 0..10 {
+            let mut units = vec![unit()];
+            retain_pending_units(&mut units, &completed);
+            assert!(units.is_empty());
+        }
+        completed.clear();
+        let mut units = vec![unit()];
+        retain_pending_units(&mut units, &completed);
+        assert_eq!(units.len(), 1);
     }
 
     #[test]
