@@ -1,5 +1,6 @@
 import copy
 import importlib.util
+import io
 import json
 import subprocess
 import tempfile
@@ -45,8 +46,10 @@ class ManifestTests(unittest.TestCase):
         entry["target_commitish"] = "main"
         self.assertEqual(manifest.build_manifest([entry], lambda tag: data)["releases"], [data])
         data["target_commitish"] = "c" * 40
-        with self.assertRaisesRegex(ValueError, "source commit differs"):
-            manifest.build_manifest([entry], lambda tag: data)
+        with patch("sys.stderr", new_callable=io.StringIO) as warnings:
+            with self.assertRaisesRegex(ValueError, "No completed desktop"):
+                manifest.build_manifest([entry], lambda tag: data)
+        self.assertIn("source commit differs", warnings.getvalue())
 
     def test_zero_desktop_skipped_with_historical_platform_fallback(self):
         windows, linux, empty = metadata(1), metadata(2), metadata(3)
@@ -92,6 +95,60 @@ class ManifestTests(unittest.TestCase):
                     with self.assertRaises((ValueError, subprocess.CalledProcessError)):
                         manifest.main()
                 self.assertEqual(output.read_text(), "previous feed")
+
+    def test_failed_history_does_not_block_valid_new_release(self):
+        old, new = metadata(1), metadata(6)
+        for failure in (subprocess.CalledProcessError(1, "gh"),
+                        subprocess.TimeoutExpired("gh", 120),
+                        json.JSONDecodeError("bad JSON", "", 0)):
+            def load(tag):
+                if tag == old["tag_name"]:
+                    raise failure
+                return new
+            with self.subTest(failure=failure), patch("sys.stderr", new_callable=io.StringIO) as warnings:
+                result = manifest.build_manifest([release(old), release(new)], load)
+                self.assertEqual(result["releases"], [new])
+                self.assertIn("Skipping " + old["tag_name"], warnings.getvalue())
+
+    def test_invalid_new_release_preserves_valid_history(self):
+        old, new = metadata(1), metadata(6)
+        for failure in ("source", "digest", "size", "url", "tag", "schema"):
+            entry, marker = release(new), copy.deepcopy(new)
+            if failure == "source":
+                marker["target_commitish"] = "c" * 40
+            elif failure == "digest":
+                entry["assets"][0]["digest"] = "sha256:" + "c" * 64
+            elif failure == "size":
+                entry["assets"][0]["size"] = 4
+            elif failure == "url":
+                marker["assets"][0]["browser_download_url"] = "https://example.com/payload"
+            elif failure == "tag":
+                marker["tag_name"] = old["tag_name"]
+            else:
+                marker = {}
+            with self.subTest(failure=failure), patch("sys.stderr", new_callable=io.StringIO) as warnings:
+                result = manifest.build_manifest([entry, release(old)],
+                    lambda tag: marker if tag == new["tag_name"] else old)
+                self.assertEqual(result["releases"], [old])
+                self.assertIn("Skipping " + new["tag_name"], warnings.getvalue())
+
+    def test_tag_lookup_failure_is_isolated_to_one_release(self):
+        old, new = metadata(1), metadata(6)
+        with patch.object(manifest, "resolve_tag_commit", side_effect=[
+                subprocess.CalledProcessError(1, "gh"), "a" * 40]):
+            result = manifest.build_manifest([release(old), release(new)],
+                lambda tag: old if tag == old["tag_name"] else new)
+        self.assertEqual(result["releases"], [new])
+
+    def test_release_listing_failure_preserves_existing_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "updates.json"
+            output.write_text("previous feed")
+            self.command.side_effect = subprocess.CalledProcessError(1, "gh")
+            with patch("sys.argv", ["generate-update-manifest.py", "--output", str(output)]):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    manifest.main()
+            self.assertEqual(output.read_text(), "previous feed")
 
     def test_server_only_metadata_generation_remains_allowed(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -150,6 +207,44 @@ class ManifestTests(unittest.TestCase):
             (directory / "Zed-x86_64.exe").write_bytes(b"abc")
             (directory / "SHA256SUMS.txt").write_text("b" * 64 + "  Zed-x86_64.exe\n")
             self.assertEqual(manifest.release_metadata(directory, "zed-cn-v1.18.1-r1", "a" * 40), metadata())
+
+
+class CommandRetryTests(unittest.TestCase):
+    def test_retry_recovers_and_discards_failed_partial_output(self):
+        error = subprocess.CalledProcessError(1, "gh", output="partial JSON")
+        with patch.object(manifest.subprocess, "check_output", side_effect=[
+                error, subprocess.TimeoutExpired("gh", 120), "complete JSON"]) as run, \
+                patch.object(manifest.time, "sleep") as sleep, \
+                patch("sys.stderr", new_callable=io.StringIO) as warnings:
+            self.assertEqual(manifest.command("gh", "api", "endpoint"), "complete JSON")
+            self.assertEqual(run.call_count, 3)
+            run.assert_called_with(("gh", "api", "endpoint"), text=True, timeout=120)
+            self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4])
+            self.assertIn("retry 2/3", warnings.getvalue())
+
+    def test_retries_are_bounded_for_exit_failure_and_timeout(self):
+        for error in (subprocess.CalledProcessError(1, "gh"),
+                      subprocess.TimeoutExpired("gh", 120)):
+            with self.subTest(error=error), \
+                    patch.object(manifest.subprocess, "check_output", side_effect=error) as run, \
+                    patch.object(manifest.time, "sleep") as sleep:
+                with self.assertRaises(type(error)):
+                    manifest.command("gh", "api", "endpoint")
+                self.assertEqual(run.call_count, 4)
+                self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4, 8])
+
+    def test_success_and_missing_executable_do_not_retry(self):
+        with patch.object(manifest.subprocess, "check_output", return_value="ok") as run, \
+                patch.object(manifest.time, "sleep") as sleep:
+            self.assertEqual(manifest.command("gh", "api", "endpoint"), "ok")
+            run.assert_called_once()
+            sleep.assert_not_called()
+        with patch.object(manifest.subprocess, "check_output", side_effect=FileNotFoundError) as run, \
+                patch.object(manifest.time, "sleep") as sleep:
+            with self.assertRaises(FileNotFoundError):
+                manifest.command("gh", "api", "endpoint")
+            run.assert_called_once()
+            sleep.assert_not_called()
 
 
 class ResolveTagCommitTests(unittest.TestCase):
