@@ -21,6 +21,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use ui::{Indicator, Modal, ModalHeader, Section, SpinnerLabel, Tooltip, prelude::*};
+use util::ResultExt;
 use workspace::ModalView;
 
 static CACHE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1000,6 +1001,8 @@ mod tests {
 
     #[test]
     fn project_scan_filters_sensitive_and_non_source_paths() {
+        assert!(!scan_git_status_allowed(git::status::FileStatus::Untracked));
+        assert!(!scan_git_status_allowed(git::status::FileStatus::Ignored));
         use util::rel_path::rel_path;
 
         assert!(scan_source_extension(rel_path("src/main.ts")));
@@ -1471,6 +1474,13 @@ fn scan_path_is_sensitive(path: &util::rel_path::RelPath) -> bool {
         || file_name.starts_with("secrets.")
 }
 
+fn scan_git_status_allowed(status: git::status::FileStatus) -> bool {
+    !matches!(
+        status,
+        git::status::FileStatus::Untracked | git::status::FileStatus::Ignored
+    )
+}
+
 fn collect_project_scan_candidates(
     project: &gpui::Entity<project::Project>,
     cx: &mut App,
@@ -1516,12 +1526,7 @@ fn collect_project_scan_candidates(
                 .read(cx)
                 .snapshot()
                 .status_for_path(&repository_path)
-                .is_some_and(|status| {
-                    matches!(
-                        status.status,
-                        git::status::FileStatus::Untracked | git::status::FileStatus::Ignored
-                    )
-                })
+                .is_some_and(|status| !scan_git_status_allowed(status.status))
             {
                 continue;
             }
@@ -1536,6 +1541,83 @@ fn collect_project_scan_candidates(
     candidates
 }
 
+struct ProjectScanModal {
+    project: gpui::Entity<project::Project>,
+    workspace: gpui::WeakEntity<workspace::Workspace>,
+    candidates: Vec<ProjectScanCandidate>,
+    error: Option<SharedString>,
+    model_label: SharedString,
+    focus_handle: FocusHandle,
+    scroll_handle: gpui::ScrollHandle,
+}
+
+impl Focusable for ProjectScanModal {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<DismissEvent> for ProjectScanModal {}
+impl ModalView for ProjectScanModal {}
+
+impl gpui::Render for ProjectScanModal {
+    fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let bytes = self
+            .candidates
+            .iter()
+            .map(|candidate| candidate.size)
+            .sum::<u64>();
+        div()
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
+            .elevation_3(cx)
+            .occlude()
+            .w(rems(56.))
+            .max_w(window.viewport_size().width * 0.9)
+            .max_h(window.viewport_size().height * 0.85)
+            .child(
+                Modal::new("project-code-explanation-scan", Some(self.scroll_handle.clone()))
+                    .header(ModalHeader::new().show_dismiss_button(true).headline("扫描项目并预生成代码讲解"))
+                    .section(Section::new().child(
+                        v_flex().gap_3()
+                            .child(Label::new(format!("{} 个候选源文件 · {:.2} MiB", self.candidates.len(), bytes as f64 / (1024. * 1024.))))
+                            .child(Label::new(format!("发送到：{}", self.model_label)))
+                            .child(Label::new("扫描范围：可见且受信任工作树中的 Git 已跟踪源码。未跟踪和被忽略的文件不会进入清单。").color(Color::Muted))
+                            .child(Label::new("还会排除敏感/私密文件、项目外链接、依赖与构建产物、配置与文档，以及超过 512 KiB 的文件。").color(Color::Muted))
+                            .child(Label::new("以下是候选清单，不代表最终请求数；读取后仍会检查语法支持、生成内容和超长行，已有缓存可复用。").color(Color::Muted))
+                            .child(Label::new("只预生成本机讲解缓存，不修改项目文件。实际发送的源码可能产生模型费用；开始后可从书本菜单停止，已发送的请求仍可能计费。").color(Color::Warning))
+                            .when(self.candidates.is_empty() && self.error.is_none(), |this| this.child(Label::new("没有符合规则的候选源码。请检查 Git 跟踪状态、工作树信任和文件类型。").color(Color::Warning)))
+                            .when_some(self.error.clone(), |this, error| this.child(Label::new(error).color(Color::Warning)))
+                            .child(Label::new("候选文件（序号 · 完整路径 · 源码大小）"))
+                            .child(div().id("scan-candidate-files").max_h(rems(24.)).overflow_y_scroll().overflow_x_scroll().children(
+                                self.candidates.iter().enumerate().map(|(index, candidate)| div().whitespace_nowrap().child(Label::new(format!("{}.  {}  ·  {:.2} KiB", index + 1, candidate.display_path, candidate.size as f64 / 1024.))))
+                            ))
+                    ))
+                    .section(Section::new().child(
+                        h_flex().justify_end().gap_2()
+                            .child(Button::new("copy-scan-list", "复制完整清单")
+                                .disabled(self.candidates.is_empty())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let list = this.candidates.iter().map(|candidate| format!("{}\t{} bytes", candidate.display_path, candidate.size)).collect::<Vec<_>>().join("\n");
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(list));
+                                })))
+                            .child(Button::new("cancel-scan", "取消").on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))))
+                            .child(Button::new("start-scan", "开始扫描")
+                                .disabled(self.error.is_some() || self.candidates.is_empty())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.error.is_some() || this.candidates.is_empty() { return; }
+                                    let project = this.project.clone();
+                                    let workspace = this.workspace.clone();
+                                    let candidates = std::mem::take(&mut this.candidates);
+                                    cx.emit(DismissEvent);
+                                    cx.spawn(async move |_, cx| start_project_scan(project, workspace, candidates, cx))
+                                        .detach_and_log_err(cx);
+                                })))
+                    )),
+            )
+    }
+}
+
 fn show_project_scan_confirmation(
     project: gpui::Entity<project::Project>,
     workspace: gpui::WeakEntity<workspace::Workspace>,
@@ -1543,57 +1625,33 @@ fn show_project_scan_confirmation(
     cx: &mut App,
 ) {
     let settings = CodeExplanationSettings::get_global(cx);
-    if resolve_model(settings, cx).is_err() || !settings.cache_persist {
-        let prompt = window.prompt(
-            gpui::PromptLevel::Warning,
-            "无法扫描当前项目",
-            Some("请先选择可用的代码讲解渠道和模型，并开启持久缓存。"),
-            &["确定"],
-            cx,
-        );
-        cx.spawn(async move |_| {
-            prompt.await.ok();
-        })
-        .detach();
-        return;
-    }
-    let candidates = collect_project_scan_candidates(&project, cx);
-    let bytes = candidates
-        .iter()
-        .map(|candidate| candidate.size)
-        .sum::<u64>();
-    let shown = candidates
-        .iter()
-        .take(200)
-        .map(|candidate| candidate.display_path.as_ref())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let omitted = candidates.len().saturating_sub(200);
-    let detail = if omitted == 0 {
-        shown
+    let model_label = format!(
+        "{} / {}",
+        settings.provider.as_deref().unwrap_or("未选择渠道"),
+        settings.model.as_deref().unwrap_or("未选择模型")
+    )
+    .into();
+    let error = (resolve_model(settings, cx).is_err() || !settings.cache_persist)
+        .then(|| SharedString::from("请先选择可用的代码讲解渠道和模型，并开启持久缓存。"));
+    let candidates = if error.is_none() {
+        collect_project_scan_candidates(&project, cx)
     } else {
-        format!("{shown}\n……以及另外 {omitted} 个文件")
+        Vec::new()
     };
-    let prompt = window.prompt(
-        gpui::PromptLevel::Warning,
-        &format!(
-            "扫描 {} 个已跟踪源文件并预生成讲解？",
-            candidates.len()
-        ),
-        Some(&format!(
-            "候选源码约 {:.2} MiB。不会修改项目文件；可随时从书本菜单停止。已经发送的请求可能仍产生费用。\n\n{detail}",
-            bytes as f64 / (1024. * 1024.)
-        )),
-        &["开始扫描", "取消"],
-        cx,
-    );
-    cx.spawn(async move |cx| {
-        if prompt.await == Ok(0) && !candidates.is_empty() {
-            start_project_scan(project, workspace, candidates, cx)?;
-        }
-        anyhow::Ok(())
-    })
-    .detach_and_log_err(cx);
+    let modal_workspace = workspace.clone();
+    workspace
+        .update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |_, cx| ProjectScanModal {
+                project,
+                workspace: modal_workspace,
+                candidates,
+                error,
+                model_label,
+                focus_handle: cx.focus_handle(),
+                scroll_handle: gpui::ScrollHandle::new(),
+            });
+        })
+        .log_err();
 }
 
 fn start_project_scan(
