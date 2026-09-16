@@ -404,14 +404,16 @@ fn show(
     let ids = editor.insert_blocks(
         [BlockProperties {
             placement: BlockPlacement::Above(anchor),
-            height: None,
+            // `height: None` would reserve no rows and paint the text over the code below; a
+            // reserved row lets the prepaint grow the block to the measured wrapped height.
+            height: Some(1),
             style: BlockStyle::Flex,
             priority: 0,
             render: Arc::new(move |cx| {
                 div()
                     .w(cx.max_width)
                     .pl(cx.anchor_x)
-                    .text_color(cx.theme().colors().text_muted)
+                    .text_color(cx.theme().status().success.opacity(0.55))
                     .child(text.clone())
                     .into_any_element()
             }),
@@ -1369,6 +1371,65 @@ mod tests {
             clear(editor, cx);
             assert!(editor.explanations.blocks.is_empty());
             assert_eq!(editor.text(cx), before);
+        });
+    }
+
+    #[gpui::test]
+    async fn virtual_annotation_blocks_reserve_rows(cx: &mut gpui::TestAppContext) {
+        crate::editor_tests::init_test(cx, |_| {});
+        let mut context = crate::test::editor_test_context::EditorTestContext::new(cx).await;
+        context
+            .cx
+            .simulate_resize(gpui::size(gpui::px(240.), gpui::px(480.)));
+        context.set_state("fn example() {ˇ}\nlet following = 1;\n");
+        context.update_editor(|editor, window, cx| {
+            let buffer = editor.buffer.read(cx).snapshot(cx);
+            let anchor = buffer.anchor_before(multi_buffer::MultiBufferOffset(0));
+            show(editor, anchor, "讲解".repeat(800).into(), cx);
+            let snapshot = editor.snapshot(window, cx);
+            for block_id in editor.explanations.blocks.iter().copied() {
+                let block = snapshot
+                    .block_for_id(crate::display_map::BlockId::Custom(block_id))
+                    .expect("讲解块应存在于显示映射中");
+                assert!(
+                    block.has_height() && block.height() > 0,
+                    "讲解块必须预留行，否则会与代码重叠"
+                );
+            }
+        });
+
+        context.cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+
+        context.editor(|editor, _, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            let heights = editor
+                .explanations
+                .blocks
+                .iter()
+                .map(|block_id| {
+                    snapshot
+                        .block_for_id(crate::display_map::BlockId::Custom(*block_id))
+                        .expect("讲解块应存在于显示映射中")
+                        .height()
+                })
+                .collect::<Vec<_>>();
+            let height = *heights.first().expect("应插入至少一个讲解块");
+            assert!(
+                height > 1,
+                "长讲解必须增长到换行后的实际高度，而不是压在一行上"
+            );
+            let following_row = snapshot
+                .point_to_display_point(language::Point::new(1, 0), text::Bias::Left)
+                .row()
+                .0;
+            assert_eq!(
+                following_row as usize,
+                height as usize + 1,
+                "讲解块必须把后续代码推到自己下方，而不是盖住它"
+            );
         });
     }
 }
