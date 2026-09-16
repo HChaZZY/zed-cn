@@ -254,7 +254,9 @@ pub mod dev {
             ToggleFpsOverlay,
             /// Resets the debug frame-time overlay's statistics, except for the
             /// total frame count.
-            ResetFrameOverlayStats
+            ResetFrameOverlayStats,
+            /// Opens the key context view for debugging keybindings.
+            OpenKeyContextView
         ]
     );
 }
@@ -681,6 +683,14 @@ pub mod assistant {
             ManageSkills,
         ]
     );
+
+    /// 将代码讲解放入新的 Agent 草稿，不自动发送。
+    #[derive(Clone, Deserialize, PartialEq, JsonSchema, Action)]
+    #[action(namespace = assistant)]
+    #[serde(deny_unknown_fields)]
+    pub struct FollowUpCodeExplanation {
+        pub text: String,
+    }
 
     /// Deploys the assistant interface with the specified configuration.
     #[derive(Clone, Default, Deserialize, PartialEq, JsonSchema, Action)]

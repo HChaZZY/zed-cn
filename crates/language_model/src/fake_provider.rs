@@ -329,6 +329,10 @@ impl LanguageModel for FakeLanguageModel {
         self.max_token_count.load(SeqCst)
     }
 
+    fn estimate_tokens(&self, text: &str) -> u64 {
+        text.chars().count() as u64
+    }
+
     fn max_output_tokens(&self) -> Option<u64> {
         let max_output_tokens = self.max_output_tokens.load(SeqCst);
         if max_output_tokens == 0 {
