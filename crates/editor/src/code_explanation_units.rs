@@ -16,6 +16,86 @@ pub struct Unit {
     pub commented_rows: Vec<usize>,
 }
 
+pub fn request_code_budget(maximum_tokens: u64) -> usize {
+    // Byte-based admission is deliberately conservative for tokenizers without a local counting API.
+    maximum_tokens
+        .saturating_sub(4096)
+        .min((MAX_REQUEST_BYTES - 8192) as u64) as usize
+}
+
+pub fn fit_units_to_budget(
+    snapshot: &language::BufferSnapshot,
+    units: Vec<Unit>,
+    budget: usize,
+    estimate_tokens: impl Fn(&str) -> u64,
+) -> Vec<Unit> {
+    let mut result = Vec::new();
+    for unit in units {
+        let code = snapshot
+            .text_for_range(unit.range.clone())
+            .collect::<String>();
+        let available = budget.saturating_sub(unit.context.len().saturating_add(256));
+        if available == 0 {
+            continue;
+        }
+        let mut start = unit.range.start;
+        let mut first_row = unit.first_row;
+        let mut bytes = 0usize;
+        let mut rows = 0usize;
+        for line in code.split_inclusive('\n') {
+            let segment_offset = start.saturating_sub(unit.range.start);
+            if bytes > 0
+                && estimate_tokens(&code[segment_offset..segment_offset + bytes + line.len()])
+                    .saturating_add(((rows + 1) * 12) as u64)
+                    > available as u64
+            {
+                let mut part = unit.clone();
+                part.range = start..start + bytes;
+                part.first_row = first_row;
+                part.last_row = first_row + rows.saturating_sub(1);
+                part.commented_rows = unit
+                    .commented_rows
+                    .iter()
+                    .filter_map(|row| {
+                        let absolute = unit.first_row + row;
+                        (absolute >= first_row && absolute < first_row + rows)
+                            .then(|| absolute - first_row)
+                    })
+                    .collect();
+                result.push(part);
+                start += bytes;
+                first_row += rows;
+                bytes = 0;
+                rows = 0;
+            }
+            if estimate_tokens(line).saturating_add(12) > available as u64 {
+                start += line.len();
+                first_row += 1;
+                continue;
+            }
+            bytes += line.len();
+            rows += 1;
+        }
+        if bytes > 0 {
+            let mut part = unit.clone();
+            part.range = start..start + bytes;
+            part.first_row = first_row;
+            part.last_row = first_row + rows.saturating_sub(1);
+            part.commented_rows = unit
+                .commented_rows
+                .iter()
+                .filter_map(|row| {
+                    let absolute = unit.first_row + row;
+                    (absolute >= first_row && absolute < first_row + rows)
+                        .then(|| absolute - first_row)
+                })
+                .collect();
+            result.push(part);
+        }
+    }
+    result
+}
+
 pub fn first_non_whitespace_column(line: &str) -> usize {
     line.char_indices()
         .find_map(|(column, character)| (!character.is_whitespace()).then_some(column))
@@ -39,19 +119,37 @@ fn function(node: tree_sitter::Node<'_>) -> bool {
 
 pub fn whole_file_unit(snapshot: &language::BufferSnapshot, maximum_lines: u64) -> Option<Unit> {
     let line_count = snapshot.max_point().row as u64 + 1;
-    if line_count > maximum_lines || snapshot.len() > MAX_REQUEST_BYTES {
+    if line_count > maximum_lines
+        || snapshot
+            .language()
+            .is_none_or(|language| language.grammar().is_none())
+        || snapshot
+            .len()
+            .saturating_add(line_count as usize * 12)
+            .saturating_add(2048)
+            > MAX_REQUEST_BYTES
+    {
         return None;
     }
     let range = 0..snapshot.len();
-    let commented_rows = snapshot
-        .text()
-        .lines()
-        .enumerate()
-        .filter_map(|(row, line)| {
-            let line = line.trim_start();
-            (line.starts_with("//") || line.starts_with('#')).then_some(row)
-        })
-        .collect();
+    let mut commented_rows = Vec::new();
+    let mut row = 0;
+    while row <= snapshot.max_point().row {
+        let units = units_at(snapshot, row);
+        let next_row = units
+            .iter()
+            .map(|unit| unit.last_row + 1)
+            .max()
+            .unwrap_or(row as usize + 1);
+        for unit in units {
+            commented_rows.extend(
+                unit.commented_rows
+                    .into_iter()
+                    .map(|comment| unit.first_row + comment),
+            );
+        }
+        row = next_row.min(u32::MAX as usize) as u32;
+    }
     Some(Unit {
         range: range.clone(),
         owner: range,
@@ -61,6 +159,33 @@ pub fn whole_file_unit(snapshot: &language::BufferSnapshot, maximum_lines: u64) 
         context: String::new(),
         commented_rows,
     })
+}
+
+pub fn file_units(snapshot: &language::BufferSnapshot, maximum_lines: u64) -> Vec<Unit> {
+    if let Some(unit) = whole_file_unit(snapshot, maximum_lines) {
+        return vec![unit];
+    }
+    let mut units = Vec::new();
+    let mut row = 0;
+    while row <= snapshot.max_point().row {
+        let candidates = units_at(snapshot, row);
+        let next = candidates
+            .iter()
+            .map(|unit| unit.last_row + 1)
+            .max()
+            .unwrap_or(row as usize + 1);
+        for unit in candidates {
+            if !unit.range.is_empty()
+                && !units
+                    .iter()
+                    .any(|existing: &Unit| existing.range == unit.range)
+            {
+                units.push(unit);
+            }
+        }
+        row = next.min(u32::MAX as usize) as u32;
+    }
+    units
 }
 
 pub fn units_at(snapshot: &language::BufferSnapshot, row: u32) -> Vec<Unit> {
@@ -183,7 +308,6 @@ pub fn parse_annotations(
         .trim();
     let annotations: Vec<Annotation> =
         serde_json::from_str(output).context("讲解返回格式无效，请重试或更换模型")?;
-    anyhow::ensure!(annotations.len() <= 128, "讲解条目过多");
     let lines = code.lines().collect::<Vec<_>>();
     let mut seen = std::collections::HashSet::new();
     Ok(annotations
@@ -197,7 +321,12 @@ pub fn parse_annotations(
                         && line.chars().any(|character| character.is_alphanumeric())
                         && !matches!(line, "else" | "else {" | "} else {" | "end")
                         && !line.starts_with("//")
-                        && !line.starts_with('#')
+                        && !(line.starts_with('#')
+                            && !line.starts_with("#[")
+                            && !line.starts_with("#include")
+                            && !line.starts_with("#define")
+                            && !line.starts_with("#if")
+                            && !line.starts_with("#endif"))
                 })
                 && !commented_rows.contains(&(annotation.line - 1))
                 && !annotation.explanation.trim().is_empty()
@@ -208,7 +337,6 @@ pub fn parse_annotations(
                     .any(|ch| ch.is_control() && ch != '\n' && ch != '\t')
                 && seen.insert(annotation.line)
         })
-        .take(16)
         .collect())
 }
 
@@ -285,6 +413,89 @@ mod tests {
         assert!(units_at(&snapshot, 3).is_empty());
     }
 
+    #[gpui::test]
+    fn file_scan_includes_all_functions(cx: &mut gpui::App) {
+        let code = "fn first() {\n    work();\n}\n\nfn second() {\n    work();\n}\n";
+        let snapshot = language::Buffer::build_snapshot_sync(
+            code.into(),
+            Some(language::rust_lang()),
+            None,
+            cx,
+        );
+        let units = file_units(&snapshot, 1);
+        assert_eq!(units.len(), 2);
+        assert!(units[0].range.end <= units[1].range.start);
+    }
+
+    #[gpui::test]
+    fn whole_file_reserves_numbering_and_requires_parser(cx: &mut gpui::App) {
+        let code = format!(
+            "fn example() {{ /*{}*/ }}",
+            "x".repeat(MAX_REQUEST_BYTES - 100)
+        );
+        let snapshot = language::Buffer::build_snapshot_sync(
+            code.into(),
+            Some(language::rust_lang()),
+            None,
+            cx,
+        );
+        assert!(whole_file_unit(&snapshot, 500).is_none());
+        let plain = language::Buffer::build_snapshot_sync("hello".into(), None, None, cx);
+        assert!(whole_file_unit(&plain, 500).is_none());
+    }
+
+    #[gpui::test]
+    fn whole_file_comments_cover_following_function(cx: &mut gpui::App) {
+        let code = "// Existing explanation\nfn example() { work(); }\n";
+        let snapshot = language::Buffer::build_snapshot_sync(
+            code.into(),
+            Some(language::rust_lang()),
+            None,
+            cx,
+        );
+        assert!(
+            whole_file_unit(&snapshot, 500)
+                .unwrap()
+                .commented_rows
+                .contains(&1)
+        );
+    }
+
+    #[gpui::test]
+    fn model_budget_splits_without_losing_unicode_or_line_mapping(cx: &mut gpui::App) {
+        let code = format!(
+            "fn example() {{\n{} }}\n",
+            "    let 名称 = 123;\n".repeat(80)
+        );
+        let snapshot = language::Buffer::build_snapshot_sync(
+            code.clone().into(),
+            Some(language::rust_lang()),
+            None,
+            cx,
+        );
+        let original = whole_file_unit(&snapshot, 500).unwrap();
+        let parts = fit_units_to_budget(&snapshot, vec![original], 512, |text| text.len() as u64);
+        assert!(parts.len() > 1);
+        let restored = parts
+            .iter()
+            .map(|part| {
+                snapshot
+                    .text_for_range(part.range.clone())
+                    .collect::<String>()
+            })
+            .collect::<String>();
+        assert_eq!(restored, code);
+        for part in parts {
+            assert_eq!(
+                snapshot.offset_to_point(part.range.start).row as usize,
+                part.first_row
+            );
+            assert!(part.range.len() <= 256);
+        }
+        assert_eq!(request_code_budget(2048), 0);
+        assert_eq!(request_code_budget(8192), 4096);
+    }
+
     #[test]
     fn indentation_column_uses_the_first_code_byte() {
         assert_eq!(first_non_whitespace_column("    value"), 4);
@@ -351,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn annotations_are_bounded_and_comment_aware() {
+    fn annotations_are_validated_without_quantity_limit_and_are_comment_aware() {
         let result = parse_annotations(r#"[{"line":1,"explanation":"existing"},{"line":2,"explanation":"valid"},{"line":2,"explanation":"duplicate"},{"line":0,"explanation":"invalid"},{"line":9,"explanation":"outside"}]"#, "one\ntwo", &[0]).unwrap();
         assert_eq!(
             result,
@@ -361,5 +572,22 @@ mod tests {
             }]
         );
         assert!(parse_annotations("not json", "code", &[]).is_err());
+
+        let code = (1..=200)
+            .map(|line| format!("let value_{line} = {line};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = (1..=200)
+            .map(|line| Annotation {
+                line,
+                explanation: format!("解释 {line}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parse_annotations(&serde_json::to_string(&output).unwrap(), &code, &[])
+                .unwrap()
+                .len(),
+            200
+        );
     }
 }

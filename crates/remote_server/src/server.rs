@@ -406,7 +406,7 @@ fn start_server(
     is_wsl_interop: bool,
 ) -> AnyProtoClient {
     // This is the server idle timeout. If no connection comes in this timeout, the server will shut down.
-    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
     let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<Envelope>();
@@ -460,10 +460,9 @@ fn start_server(
             };
 
             let mut input_buffer = Vec::new();
-            let mut output_buffer = Vec::new();
 
             let (mut stdin_msg_tx, mut stdin_msg_rx) = mpsc::unbounded::<Envelope>();
-            cx.background_spawn(async move {
+            let _stdin_task = cx.background_spawn(async move {
                 loop {
                     match read_message(&mut stdin_stream, &mut input_buffer).await {
                         Ok(msg) => {
@@ -478,57 +477,22 @@ fn start_server(
                         }
                     }
                 }
-            }).detach();
+            });
 
-            loop {
-
-                select_biased! {
-                    _ = app_quit_rx.next().fuse() => {
-                        return anyhow::Ok(());
-                    }
-
-                    stdin_message = stdin_msg_rx.next().fuse() => {
-                        let Some(message) = stdin_message else {
-                            log::warn!("error reading message on stdin, dropping connection.");
-                            break;
-                        };
-                        if let Err(error) = incoming_tx.unbounded_send(message) {
-                            log::error!("failed to send message to application: {error:?}. exiting.");
-                            return Err(anyhow!(error));
-                        }
-                    }
-
-                    outgoing_message  = outgoing_rx.next().fuse() => {
-                        let Some(message) = outgoing_message else {
-                            log::error!("stdout handler, no message");
-                            break;
-                        };
-
-                        if let Err(error) =
-                            write_message(&mut stdout_stream, &mut output_buffer, message).await
-                        {
-                            log::error!("failed to write stdout message: {:?}", error);
-                            break;
-                        }
-                        if let Err(error) = stdout_stream.flush().await {
-                            log::error!("failed to flush stdout message: {:?}", error);
-                            break;
-                        }
-                    }
-
-                    log_message = log_rx.recv().fuse() => {
-                        if let Ok(log_message) = log_message {
-                            if let Err(error) = stderr_stream.write_all(&log_message).await {
-                                log::error!("failed to write log message to stderr: {:?}", error);
-                                break;
-                            }
-                            if let Err(error) = stderr_stream.flush().await {
-                                log::error!("failed to flush stderr stream: {:?}", error);
-                                break;
-                            }
-                        }
-                    }
-                }
+            let executor = cx.background_executor().clone();
+            let mut stdout_stream = ProgressTimeoutWriter::new(&mut stdout_stream, executor.clone());
+            let mut stderr_stream = ProgressTimeoutWriter::new(&mut stderr_stream, executor);
+            match forward_connection(
+                (&mut stdout_stream, &mut stderr_stream),
+                &mut stdin_msg_rx,
+                &incoming_tx,
+                &mut outgoing_rx,
+                &log_rx,
+                &mut app_quit_rx,
+            ).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => log::info!("remote input closed, waiting for reconnection"),
+                Err(error) => log::warn!("remote connection closed: {error:#}"),
             }
         }
         anyhow::Ok(())
@@ -536,6 +500,137 @@ fn start_server(
     .detach();
 
     RemoteClient::proto_client_from_channels(incoming_rx, outgoing_tx, cx, "server", is_wsl_interop)
+}
+
+const CONNECTION_WRITE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+struct ProgressTimeoutWriter<W> {
+    inner: W,
+    executor: gpui::BackgroundExecutor,
+    stalled: Option<gpui::Task<()>>,
+}
+
+impl<W> ProgressTimeoutWriter<W> {
+    fn new(inner: W, executor: gpui::BackgroundExecutor) -> Self {
+        Self {
+            inner,
+            executor,
+            stalled: None,
+        }
+    }
+
+    fn poll_stall(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::future::Future;
+        let timer = self
+            .stalled
+            .get_or_insert_with(|| self.executor.timer(CONNECTION_WRITE_IDLE_TIMEOUT));
+        if std::pin::Pin::new(timer).poll(cx).is_ready() {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "remote connection write made no progress for 60 seconds",
+            )))
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for ProgressTimeoutWriter<W> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.inner).poll_write(cx, bytes) {
+            std::task::Poll::Pending => this.poll_stall(cx).map(|result| result.map(|()| 0)),
+            result => {
+                this.stalled = None;
+                result
+            }
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.inner).poll_flush(cx) {
+            std::task::Poll::Pending => this.poll_stall(cx),
+            result => {
+                this.stalled = None;
+                result
+            }
+        }
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.inner).poll_close(cx) {
+            std::task::Poll::Pending => this.poll_stall(cx),
+            result => {
+                this.stalled = None;
+                result
+            }
+        }
+    }
+}
+
+async fn forward_connection(
+    (stdout, stderr): (
+        &mut (impl AsyncWrite + Unpin),
+        &mut (impl AsyncWrite + Unpin),
+    ),
+    incoming: &mut mpsc::UnboundedReceiver<Envelope>,
+    application: &mpsc::UnboundedSender<Envelope>,
+    outgoing: &mut mpsc::UnboundedReceiver<Envelope>,
+    logs: &Receiver<Vec<u8>>,
+    quit: &mut mpsc::UnboundedReceiver<()>,
+) -> Result<bool> {
+    // Preserve partial writes across input events, but cancel both writers on EOF.
+    // Awaiting either write inside the input loop can prevent reconnect forever.
+    let write_output = async {
+        let mut buffer = Vec::new();
+        while let Some(message) = outgoing.next().await {
+            write_message(stdout, &mut buffer, message).await?;
+            stdout.flush().await?;
+        }
+        anyhow::bail!("outgoing message channel closed")
+    }
+    .fuse();
+    let write_logs = async {
+        while let Ok(message) = logs.recv().await {
+            stderr.write_all(&message).await?;
+            stderr.flush().await?;
+        }
+        anyhow::bail!("log channel closed")
+    }
+    .fuse();
+    futures::pin_mut!(write_output, write_logs);
+    loop {
+        select_biased! {
+            _ = quit.next().fuse() => return Ok(true),
+            message = incoming.next().fuse() => {
+                let Some(message) = message else { return Ok(false) };
+                application.unbounded_send(message).context("forwarding remote input")?;
+            }
+            result = write_output => {
+                let result: Result<()> = result;
+                return result.context("remote output writer stopped").map(|()| false);
+            }
+            result = write_logs => {
+                let result: Result<()> = result;
+                return result.context("remote log writer stopped").map(|()| false);
+            }
+        }
+    }
 }
 
 fn init_paths() -> anyhow::Result<()> {
@@ -1315,6 +1410,172 @@ fn read_proxy_settings(cx: &mut Context<HeadlessProject>) -> Option<Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BlockedWriter;
+
+    impl AsyncWrite for BlockedWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[gpui::test]
+    async fn stalled_connection_writer_times_out(cx: &mut gpui::TestAppContext) {
+        let mut writer = ProgressTimeoutWriter::new(BlockedWriter, cx.background_executor.clone());
+        let error = writer
+            .write_all(&[1])
+            .await
+            .expect_err("stalled write must terminate");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let mut writer = ProgressTimeoutWriter::new(BlockedWriter, cx.background_executor.clone());
+        assert_eq!(
+            writer
+                .flush()
+                .await
+                .expect_err("stalled flush must terminate")
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
+
+    #[gpui::test]
+    async fn write_progress_resets_stall_deadline(cx: &mut gpui::TestAppContext) {
+        struct GatedWriter(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl AsyncWrite for GatedWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                bytes: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::task::Poll::Ready(Ok(bytes.len()))
+                } else {
+                    std::task::Poll::Pending
+                }
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_close(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let writable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut writer = ProgressTimeoutWriter::new(
+            GatedWriter(writable.clone()),
+            cx.background_executor.clone(),
+        );
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(
+            std::pin::Pin::new(&mut writer)
+                .poll_write(&mut context, &[1])
+                .is_pending()
+        );
+        cx.executor()
+            .advance_clock(CONNECTION_WRITE_IDLE_TIMEOUT / 2);
+        writable.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            std::pin::Pin::new(&mut writer).poll_write(&mut context, &[1]),
+            std::task::Poll::Ready(Ok(1))
+        ));
+        writable.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            std::pin::Pin::new(&mut writer)
+                .poll_write(&mut context, &[2])
+                .is_pending()
+        );
+        cx.executor()
+            .advance_clock(CONNECTION_WRITE_IDLE_TIMEOUT / 2);
+        assert!(
+            std::pin::Pin::new(&mut writer)
+                .poll_write(&mut context, &[2])
+                .is_pending()
+        );
+        cx.executor().advance_clock(CONNECTION_WRITE_IDLE_TIMEOUT);
+        assert!(
+            matches!(std::pin::Pin::new(&mut writer).poll_write(&mut context, &[2]), std::task::Poll::Ready(Err(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+    }
+
+    #[gpui::test]
+    async fn idle_connection_writer_has_no_deadline(cx: &mut gpui::TestAppContext) {
+        let mut writer = ProgressTimeoutWriter::new(Vec::new(), cx.background_executor.clone());
+        cx.executor()
+            .advance_clock(CONNECTION_WRITE_IDLE_TIMEOUT * 2);
+        writer
+            .write_all(&[1, 2, 3])
+            .await
+            .expect("idle time is not write stall time");
+        writer.flush().await.expect("flush");
+        assert_eq!(writer.inner, vec![1, 2, 3]);
+        assert!(writer.stalled.is_none());
+    }
+
+    #[gpui::test]
+    async fn blocked_output_and_logs_do_not_block_input_or_disconnect(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (incoming_tx, mut incoming_rx) = mpsc::unbounded();
+        let (application_tx, mut application_rx) = mpsc::unbounded();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded();
+        let (log_tx, log_rx) = smol::channel::unbounded();
+        let (_quit_tx, mut quit_rx) = mpsc::unbounded();
+        outgoing_tx
+            .unbounded_send(Envelope::default())
+            .expect("queue output");
+        log_tx.send(vec![1]).await.expect("queue log");
+        let task = cx.executor().spawn(async move {
+            forward_connection(
+                (&mut BlockedWriter, &mut BlockedWriter),
+                &mut incoming_rx,
+                &application_tx,
+                &mut outgoing_rx,
+                &log_rx,
+                &mut quit_rx,
+            )
+            .await
+        });
+        cx.run_until_parked();
+        incoming_tx
+            .unbounded_send(Envelope {
+                id: 42,
+                ..Default::default()
+            })
+            .expect("deliver input");
+        assert_eq!(
+            application_rx.next().await.expect("input progresses").id,
+            42
+        );
+        drop(incoming_tx);
+        assert!(
+            !task
+                .await
+                .expect("disconnect progresses despite blocked writers")
+        );
+    }
 
     #[test]
     fn rotated_remote_log_path_uses_numbered_log_suffix() {

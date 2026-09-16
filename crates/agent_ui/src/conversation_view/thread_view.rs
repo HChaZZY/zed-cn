@@ -8668,7 +8668,6 @@ impl ThreadView {
                             .size(IconSize::XSmall),
                     )
                     .tooltip({
-                        let tooltip = tooltip.clone();
                         let url = url.clone();
                         move |_, cx| Tooltip::with_meta(tooltip.as_str(), None, url.clone(), cx)
                     })

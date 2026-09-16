@@ -170,6 +170,8 @@ pub trait RemoteClientDelegate: Send + Sync {
 const MAX_MISSED_HEARTBEATS: usize = 5;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+// Replaying queued responses can take much longer than an idle heartbeat.
+const RECONNECT_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 const INITIAL_CONNECTION_TIMEOUT: Duration =
     Duration::from_secs(if cfg!(debug_assertions) { 5 } else { 60 });
 
@@ -368,6 +370,7 @@ pub struct RemoteClient {
     reconnect_cancellation: Option<oneshot::Sender<()>>,
     reconnect_status: Option<String>,
     manual_reconnect: bool,
+    connection_generation: u64,
 }
 
 #[derive(Debug)]
@@ -535,6 +538,7 @@ impl RemoteClient {
                     reconnect_cancellation: None,
                     reconnect_status: None,
                     manual_reconnect: false,
+                    connection_generation: 0,
                 });
 
                 let session_invalidated = client.session_invalidated.wait();
@@ -787,6 +791,7 @@ impl RemoteClient {
             );
         }
 
+        self.connection_generation = self.connection_generation.wrapping_add(1);
         let unique_identifier = self.unique_identifier.clone();
         let client = self.client.clone();
         let (reconnect_cancellation_tx, reconnect_cancellation_rx) = oneshot::channel();
@@ -880,7 +885,7 @@ impl RemoteClient {
                 let multiplex_task = Self::monitor(this.clone(), io_task, cx);
                 client.reconnect(incoming_rx, outgoing_tx, cx);
 
-                if let Err(error) = client.resync(HEARTBEAT_TIMEOUT).await {
+                if let Err(error) = client.resync(RECONNECT_SYNC_TIMEOUT).await {
                     failed!(error, attempts, remote_connection, delegate);
                 };
                 if client.session_is_invalid.load(SeqCst) {
@@ -996,7 +1001,10 @@ impl RemoteClient {
                         log::debug!("Sending heartbeat to server...");
 
                         let result = select_biased! {
-                            _ = connection_activity_rx.next().fuse() => {
+                            activity = connection_activity_rx.next().fuse() => {
+                                if activity.is_none() {
+                                    anyhow::bail!("remote connection activity channel closed during heartbeat");
+                                }
                                 Ok(())
                             }
                             ping_result = client.ping(HEARTBEAT_TIMEOUT).fuse() => {
@@ -1015,6 +1023,7 @@ impl RemoteClient {
                         } else if missed_heartbeats != 0 {
                             missed_heartbeats = 0;
                         } else {
+                            keepalive_timer.set(cx.background_executor().timer(HEARTBEAT_INTERVAL).fuse());
                             continue;
                         }
 
@@ -1069,8 +1078,16 @@ impl RemoteClient {
         io_task: Task<Result<i32>>,
         cx: &AsyncApp,
     ) -> Task<Result<()>> {
+        let generation = match this.read_with(cx, |this, _| this.connection_generation) {
+            Ok(generation) => generation,
+            Err(error) => return Task::ready(Err(error)),
+        };
         cx.spawn(async move |cx| {
             let result = io_task.await;
+            if !this.read_with(cx, |this, _| this.connection_generation == generation)? {
+                log::debug!("ignoring obsolete remote transport completion");
+                return Ok(());
+            }
 
             match result {
                 Ok(exit_code) => {
@@ -1480,6 +1497,7 @@ impl RemoteClient {
                 reconnect_cancellation: None,
                 reconnect_status: None,
                 manual_reconnect: false,
+                connection_generation: 0,
             }
         })
     }
@@ -1684,6 +1702,71 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
     use rpc::{ErrorCodeExt, TypedEnvelope, proto::ErrorCode};
+
+    #[gpui::test]
+    async fn successful_heartbeats_keep_their_interval(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| release_channel::init(Version::new(0, 0, 0), cx));
+        let (options, server, guard) = RemoteClient::fake_server(cx, server_cx);
+        let handler = server_cx.new(|_| ());
+        let pings = Arc::new(AtomicU32::new(0));
+        server.add_request_handler(handler.downgrade(), {
+            let pings = pings.clone();
+            move |_, _: TypedEnvelope<proto::Ping>, _| {
+                pings.fetch_add(1, SeqCst);
+                async { Ok(proto::Ack {}) }
+            }
+        });
+        drop(guard);
+        let client = RemoteClient::connect_mock(options, cx).await;
+        // Exclude transport activity so only successful ping responses rearm the timer.
+        let (_activity_tx, activity_rx) = mpsc::channel(1);
+        let heartbeat =
+            RemoteClient::heartbeat(client.downgrade(), activity_rx, &mut cx.to_async());
+        client.update(cx, |client, _| match client.state.as_mut() {
+            Some(State::Connected { heartbeat_task, .. }) => *heartbeat_task = heartbeat,
+            _ => panic!("expected connected state"),
+        });
+        cx.run_until_parked();
+        let initial = pings.load(SeqCst);
+        for expected in 1..=3 {
+            cx.executor().advance_clock(HEARTBEAT_INTERVAL);
+            cx.run_until_parked();
+            assert_eq!(pings.load(SeqCst), initial + expected);
+        }
+    }
+
+    #[gpui::test]
+    async fn obsolete_proxy_exit_cannot_disconnect_new_attempt(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| release_channel::init(Version::new(0, 0, 0), cx));
+        let (options, server, guard) = RemoteClient::fake_server(cx, server_cx);
+        let handler = server_cx.new(|_| ());
+        server.add_request_handler(
+            handler.downgrade(),
+            |_, _: TypedEnvelope<proto::Ping>, _| async { Ok(proto::Ack {}) },
+        );
+        drop(guard);
+        let client = RemoteClient::connect_mock(options, cx).await;
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let io_task = cx
+            .executor()
+            .spawn(async move { exit_rx.await.context("exit signal") });
+        let monitor = RemoteClient::monitor(client.downgrade(), io_task, &cx.to_async());
+        client.update(cx, |client, _| client.connection_generation += 1);
+        exit_tx
+            .send(ProxyLaunchError::ServerNotRunning.to_exit_code())
+            .expect("exit signal");
+        monitor.await.expect("obsolete monitor finishes");
+        assert_eq!(
+            client.read_with(cx, |client, _| client.connection_state()),
+            ConnectionState::Connected
+        );
+    }
 
     #[gpui::test]
     async fn missing_server_during_reconnect_disconnects_old_session(
@@ -2013,6 +2096,62 @@ mod tests {
         assert!(client.outgoing_progress.lock().is_empty());
     }
 
+    #[gpui::test]
+    async fn cancelled_requests_release_response_channels(cx: &mut TestAppContext) {
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded();
+        let (outgoing_tx, _outgoing_rx) = mpsc::unbounded();
+        let client =
+            cx.update(|cx| ChannelClient::new(incoming_rx, outgoing_tx, cx, "test", false));
+        let request = client.request(proto::Ping {});
+        assert_eq!(client.response_channels.lock().len(), 1);
+        drop(request);
+        assert!(client.response_channels.lock().is_empty());
+        assert!(client.ping(HEARTBEAT_TIMEOUT).await.is_err());
+        assert!(client.response_channels.lock().is_empty());
+        // Cancellation must not discard operations whose execution is uncertain.
+        assert!(!client.buffer.lock().is_empty());
+    }
+
+    #[gpui::test]
+    async fn reconnect_sync_accepts_slow_legacy_ack(cx: &mut TestAppContext) {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<Envelope>();
+        let client =
+            cx.update(|cx| ChannelClient::new(incoming_rx, outgoing_tx, cx, "test", false));
+        let executor = cx.background_executor.clone();
+        let responder = cx.executor().spawn(async move {
+            while let Some(message) = outgoing_rx.next().await {
+                if matches!(
+                    message.payload,
+                    Some(proto::envelope::Payload::FlushBufferedMessages(_))
+                ) {
+                    executor.timer(HEARTBEAT_TIMEOUT * 2).await;
+                    incoming_tx
+                        .unbounded_send(proto::Ack {}.into_envelope(100, Some(message.id), None))
+                        .expect("deliver legacy ack");
+                    break;
+                }
+            }
+        });
+        client
+            .resync(RECONNECT_SYNC_TIMEOUT)
+            .await
+            .expect("slow session sync should succeed");
+        responder.await;
+        assert!(client.response_channels.lock().is_empty());
+    }
+
+    #[gpui::test]
+    async fn reconnect_sync_timeout_releases_request(cx: &mut TestAppContext) {
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded();
+        let (outgoing_tx, _outgoing_rx) = mpsc::unbounded();
+        let client =
+            cx.update(|cx| ChannelClient::new(incoming_rx, outgoing_tx, cx, "test", false));
+        assert!(client.resync(RECONNECT_SYNC_TIMEOUT).await.is_err());
+        assert!(client.response_channels.lock().is_empty());
+        assert!(client.buffer.lock().is_empty());
+    }
+
     #[test]
     fn missing_worktree_errors_are_scoped_to_project_requests() {
         assert!(is_missing_remote_worktree(
@@ -2289,7 +2428,8 @@ pub trait RemoteConnection: Send + Sync {
     fn simulate_disconnect(&self, _: &AsyncApp) {}
 }
 
-type ResponseChannels = Mutex<HashMap<MessageId, oneshot::Sender<(Envelope, oneshot::Sender<()>)>>>;
+type ResponseChannels =
+    Arc<Mutex<HashMap<MessageId, oneshot::Sender<(Envelope, oneshot::Sender<()>)>>>>;
 type StreamResponseChannels =
     Arc<Mutex<HashMap<MessageId, UnboundedSender<(Result<Envelope>, oneshot::Sender<()>)>>>>;
 
@@ -2634,8 +2774,10 @@ impl ChannelClient {
         if let Some(progress) = progress {
             outgoing_progress.lock().insert(message_id, progress);
         }
+        let response_channels = self.response_channels.clone();
         let cleanup_progress = util::defer(move || {
             outgoing_progress.lock().remove(&message_id);
+            response_channels.lock().remove(&MessageId(message_id));
         });
         let result = if use_buffer {
             self.send_buffered(envelope)
