@@ -211,6 +211,15 @@ pub trait LanguageModel: Send + Sync {
     }
 
     fn max_token_count(&self) -> u64;
+
+    /// Estimates tokens for plain text used for client-side admission. Implementations may
+    /// override this when they have a tokenizer matching the provider; the default is a
+    /// conservative Unicode-aware estimate and must never be described as exact.
+    fn estimate_tokens(&self, text: &str) -> u64 {
+        let bytes = text.len() as u64;
+        let characters = text.chars().count() as u64;
+        bytes.max(characters.saturating_mul(2))
+    }
     fn max_output_tokens(&self) -> Option<u64> {
         None
     }
