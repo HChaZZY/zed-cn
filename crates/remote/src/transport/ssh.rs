@@ -42,6 +42,8 @@ const REMOTE_SERVER_DOWNLOAD_IDLE_TIMEOUT_SECS: u64 = 30;
 const REMOTE_SERVER_DOWNLOAD_TOTAL_TIMEOUT_SECS: u64 = 300;
 const REMOTE_SERVER_DOWNLOAD_TOTAL_TIMEOUT: Duration =
     Duration::from_secs(REMOTE_SERVER_DOWNLOAD_TOTAL_TIMEOUT_SECS);
+const REMOTE_SERVER_UPLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
+const REMOTE_SERVER_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long to wait for a remote shell/platform detection command to finish
 /// before giving up.
@@ -1170,11 +1172,13 @@ impl SshRemoteConnection {
         if let Some(parent) = tmp_path.parent() {
             let res = self
                 .socket
-                .run_command(
+                .run_command_with_timeout(
                     self.ssh_shell_kind,
                     "mkdir",
                     &["-p", parent.display(self.path_style()).as_ref()],
                     true,
+                    REMOTE_COMMAND_TIMEOUT,
+                    cx,
                 )
                 .await;
             if !self.ssh_platform.os.is_windows() {
@@ -1468,11 +1472,13 @@ impl SshRemoteConnection {
         if let Some(parent) = tmp_path.parent() {
             let res = self
                 .socket
-                .run_command(
+                .run_command_with_timeout(
                     self.ssh_shell_kind,
                     "mkdir",
                     &["-p", parent.display(self.path_style()).as_ref()],
                     true,
+                    REMOTE_COMMAND_TIMEOUT,
+                    cx,
                 )
                 .await;
             if !self.ssh_platform.os.is_windows() {
@@ -1510,18 +1516,34 @@ impl SshRemoteConnection {
         cx: &mut AsyncApp,
     ) -> Result<()> {
         delegate.set_status(Some("正在远程主机上解压远程开发服务"), cx);
+        let started_at = Instant::now();
+        log::info!("extracting remote development server to {dst_path:?}");
 
-        if self.ssh_platform.os.is_windows() {
-            self.extract_server_binary_windows(dst_path, tmp_path).await
+        let result = if self.ssh_platform.os.is_windows() {
+            self.extract_server_binary_windows(dst_path, tmp_path, cx)
+                .await
         } else {
-            self.extract_server_binary_posix(dst_path, tmp_path).await
+            self.extract_server_binary_posix(dst_path, tmp_path, cx)
+                .await
+        };
+        match &result {
+            Ok(()) => log::info!(
+                "extracted remote development server in {:?}",
+                started_at.elapsed()
+            ),
+            Err(error) => log::warn!(
+                "failed to extract remote development server after {:?}: {error:#}",
+                started_at.elapsed()
+            ),
         }
+        result
     }
 
     async fn extract_server_binary_posix(
         &self,
         dst_path: &RelPath,
         tmp_path: &RelPath,
+        cx: &AsyncApp,
     ) -> Result<()> {
         let shell_kind = ShellKind::Posix;
         let server_mode = 0o755;
@@ -1548,7 +1570,14 @@ impl SshRemoteConnection {
         };
         let args = shell_kind.args_for_shell(false, script.to_string());
         self.socket
-            .run_command(self.ssh_shell_kind, "sh", &args, true)
+            .run_command_with_timeout(
+                self.ssh_shell_kind,
+                "sh",
+                &args,
+                true,
+                REMOTE_SERVER_INSTALL_TIMEOUT,
+                cx,
+            )
             .await?;
         Ok(())
     }
@@ -1557,6 +1586,7 @@ impl SshRemoteConnection {
         &self,
         dst_path: &RelPath,
         tmp_path: &RelPath,
+        cx: &AsyncApp,
     ) -> Result<()> {
         let shell_kind = ShellKind::Pwsh;
         let orig_tmp_path = tmp_path.display(self.path_style());
@@ -1584,7 +1614,14 @@ impl SshRemoteConnection {
 
         let args = shell_kind.args_for_shell(false, script);
         self.socket
-            .run_command(self.ssh_shell_kind, "powershell", &args, true)
+            .run_command_with_timeout(
+                self.ssh_shell_kind,
+                "powershell",
+                &args,
+                true,
+                REMOTE_SERVER_INSTALL_TIMEOUT,
+                cx,
+            )
             .await?;
         Ok(())
     }
@@ -1661,6 +1698,7 @@ impl SshRemoteConnection {
         if Self::is_sftp_available().await {
             log::debug!("using SFTP for file upload");
             let mut command = self.build_sftp_command();
+            command.kill_on_drop(true);
             let sftp_batch = sftp_put_command(&src_path_display, &dest_path_str);
 
             let mut child = command.spawn()?;
@@ -1718,10 +1756,16 @@ impl SshRemoteConnection {
     ) -> Result<std::process::Output> {
         let output = child.output().fuse();
         futures::pin_mut!(output);
+        let started_at = Instant::now();
         loop {
             select_biased! {
                 output = output => return Ok(output?),
                 _ = cx.background_executor().timer(Duration::from_millis(250)).fuse() => {
+                    anyhow::ensure!(
+                        started_at.elapsed() < REMOTE_SERVER_UPLOAD_TOTAL_TIMEOUT,
+                        "uploading remote development server timed out after {:?}",
+                        REMOTE_SERVER_UPLOAD_TOTAL_TIMEOUT
+                    );
                     if total_bytes == 0 {
                         continue;
                     }
@@ -1855,27 +1899,8 @@ impl SshSocket {
         command
     }
 
-    async fn run_command(
-        &self,
-        shell_kind: ShellKind,
-        program: &str,
-        args: &[impl AsRef<str>],
-        allow_pseudo_tty: bool,
-    ) -> Result<String> {
-        let mut command = self.ssh_command(shell_kind, program, args, allow_pseudo_tty);
-        let output = command.output().await?;
-        log::debug!("{:?}: {:?}", command, output);
-        anyhow::ensure!(
-            output.status.success(),
-            "failed to run command {command:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    }
-
-    /// Like [`Self::run_command`], but fails with an error if the remote
-    /// command does not finish within `timeout`. The spawned `ssh` process is
-    /// killed on drop so a wedged session cannot leak.
+    /// Runs a remote command and fails if it does not finish within `timeout`.
+    /// The spawned `ssh` process is killed on drop so a wedged session cannot leak.
     async fn run_command_with_timeout(
         &self,
         shell_kind: ShellKind,
