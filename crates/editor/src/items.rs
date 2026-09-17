@@ -1,7 +1,7 @@
 use crate::{
     ActiveDebugLine, Anchor, Autoscroll, BufferSerialization, Capability, Editor, EditorEvent,
     EditorSettings, ExcerptRange, FormatTarget, MultiBuffer, MultiBufferSnapshot, NavigationData,
-    ReportEditorEvent, SelectionEffects, ToPoint as _,
+    ReportEditorEvent, SelectionEffects, ToPoint as _, code_explanations,
     display_map::HighlightKey,
     editor_settings::SeedQuerySetting,
     persistence::{EditorDb, SerializedEditor},
@@ -1014,6 +1014,12 @@ impl Item for Editor {
                     .await?;
             }
 
+            if !options.autosave {
+                this.update(cx, |editor, cx| {
+                    code_explanations::request_refresh(editor);
+                    cx.notify();
+                })?;
+            }
             Ok(())
         })
     }
