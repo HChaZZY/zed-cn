@@ -167,13 +167,13 @@ impl ZedAiOnboarding {
             .gap_1()
             .child(Headline::new("欢迎使用 Zed AI"))
             .child(
-                Label::new("登录即可免费试用 Zed Pro 14 天。")
+                Label::new("登录即可试用 GPT Luna；14 天试用期将在开始试用时计算。")
                     .color(Color::Muted)
                     .mb_2(),
             )
             .child(PlanDefinitions.sign_in_upsell())
             .child(
-                Button::new("sign_in", "免费试用Zed Pro")
+                Button::new("sign_in", "登录并试用 GPT Luna")
                     .disabled(signing_in)
                     .full_width()
                     .style(ButtonStyle::Tinted(ui::TintColor::Accent))
@@ -300,7 +300,7 @@ impl ZedAiOnboarding {
             .child(Self::pro_trial_stamp(cx))
             .child(Headline::new("欢迎试用 Zed Pro"))
             .child(
-                Label::new("以下是你接下来 14 天获得的内容：")
+                Label::new("试用开始后的 14 天内包含以下权益：")
                     .color(Color::Muted)
                     .mb_2(),
             )

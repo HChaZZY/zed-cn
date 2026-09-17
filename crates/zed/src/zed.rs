@@ -643,7 +643,8 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_left_item(activity_indicator, window, cx);
             status_bar.add_left_item(file_transfer_indicator, window, cx);
             let explanations = cx.new(|cx| {
-                cx.observe_global::<settings::SettingsStore>(|_, cx| cx.notify()).detach();
+                cx.observe_global::<settings::SettingsStore>(|_, cx| cx.notify())
+                    .detach();
                 editor::code_explanations::CodeExplanationIndicator::default()
             });
             status_bar.add_right_item(explanations, window, cx);
@@ -5950,6 +5951,7 @@ mod tests {
                 "language_selector",
                 "welcome",
                 "line_ending_selector",
+                "lsp_command_selector",
                 "lsp_tool",
                 "markdown",
                 "menu",

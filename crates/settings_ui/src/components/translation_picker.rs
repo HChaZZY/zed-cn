@@ -28,11 +28,7 @@ impl TranslationPickerDelegate {
         // Make sure the picker always has at least the current value, so the
         // list is never empty even when no options are available.
         let mut options = options;
-        if !options
-            .iter()
-            .any(|(value, _)| *value == current_value)
-            && !current_value.is_empty()
-        {
+        if !options.iter().any(|(value, _)| *value == current_value) && !current_value.is_empty() {
             options.push((current_value.clone(), current_value.clone()));
         }
         let selected_index = options
@@ -76,7 +72,12 @@ impl PickerDelegate for TranslationPickerDelegate {
         self.selected_index
     }
 
-    fn set_selected_index(&mut self, ix: usize, _: &mut Window, cx: &mut Context<TranslationPicker>) {
+    fn set_selected_index(
+        &mut self,
+        ix: usize,
+        _: &mut Window,
+        cx: &mut Context<TranslationPicker>,
+    ) {
         self.selected_index = ix.min(self.filtered.len().saturating_sub(1));
         cx.notify();
     }
@@ -138,7 +139,12 @@ impl PickerDelegate for TranslationPickerDelegate {
         Task::ready(())
     }
 
-    fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<TranslationPicker>) {
+    fn confirm(
+        &mut self,
+        _secondary: bool,
+        window: &mut Window,
+        cx: &mut Context<TranslationPicker>,
+    ) {
         if let Some(match_result) = self.filtered.get(self.selected_index) {
             let value = self.options[match_result.candidate_id].0.clone();
             (self.on_selected)(value, window, cx);

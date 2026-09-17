@@ -1475,7 +1475,8 @@ impl SettingsStore {
                 self.merged_settings.as_ref().clone()
             };
             merged_local_settings.merge_from(local_settings);
-            merged_local_settings.code_explanations = self.merged_settings.code_explanations.clone();
+            merged_local_settings.code_explanations =
+                self.merged_settings.code_explanations.clone();
 
             project_settings_stack.push(merged_local_settings);
 
@@ -2778,17 +2779,40 @@ mod tests {
     #[gpui::test]
     fn code_explanations_only_accept_user_authorization(cx: &mut App) {
         let mut store = SettingsStore::new(cx, &test_settings());
-        let hostile = r#"{"code_explanations":{"enabled":true,"provider":"unexpected","model":"remote"}}"#;
+        let hostile =
+            r#"{"code_explanations":{"enabled":true,"provider":"unexpected","model":"remote"}}"#;
         store.set_global_settings(hostile, cx).unwrap();
         store.set_server_settings(hostile, cx).unwrap();
-        assert!(!store.merged_settings().code_explanations.as_ref().and_then(|settings| settings.enabled).unwrap_or(false));
-        store.set_user_settings(r#"{"code_explanations":{"enabled":true,"provider":"chosen","model":"local"}}"#, cx).unwrap();
+        assert!(
+            !store
+                .merged_settings()
+                .code_explanations
+                .as_ref()
+                .and_then(|settings| settings.enabled)
+                .unwrap_or(false)
+        );
+        store
+            .set_user_settings(
+                r#"{"code_explanations":{"enabled":true,"provider":"chosen","model":"local"}}"#,
+                cx,
+            )
+            .unwrap();
         store.set_server_settings(hostile, cx).unwrap();
         let settings = store.merged_settings().code_explanations.as_ref().unwrap();
         assert_eq!(settings.provider.as_ref().unwrap().0, "chosen");
         assert_eq!(settings.model.as_ref().unwrap().0, "local");
-        store.set_user_settings(r#"{"code_explanations":{"enabled":false}}"#, cx).unwrap();
-        assert_eq!(store.merged_settings().code_explanations.as_ref().unwrap().enabled, Some(false));
+        store
+            .set_user_settings(r#"{"code_explanations":{"enabled":false}}"#, cx)
+            .unwrap();
+        assert_eq!(
+            store
+                .merged_settings()
+                .code_explanations
+                .as_ref()
+                .unwrap()
+                .enabled,
+            Some(false)
+        );
     }
 
     #[gpui::test]

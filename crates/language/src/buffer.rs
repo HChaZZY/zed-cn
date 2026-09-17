@@ -9,18 +9,19 @@ use crate::{
     diagnostic_set::{DiagnosticEntry, DiagnosticEntryRef, DiagnosticGroup},
     language_settings::{AutoIndentMode, LanguageSettings},
     outline::OutlineItem,
-    row_chunk::RowChunks,
+    row_chunk::{RowChunkId, RowChunks},
     runnable::{self, RunnableRange},
     syntax_map::{
         MAX_BYTES_TO_QUERY, SyntaxLayer, SyntaxMap, SyntaxMapCapture, SyntaxMapCaptures,
         SyntaxMapMatch, SyntaxMapMatches, SyntaxSnapshot, ToTreeSitterPoint,
+        flattened_highlight_regions,
     },
     text_diff::text_diff,
     unified_diff_with_offsets,
 };
 pub use crate::{
-    Grammar, HighlightId, HighlightMap, Language, LanguageRegistry, diagnostic_set::DiagnosticSet,
-    proto,
+    CaptureId, Grammar, HighlightId, HighlightMap, Language, LanguageRegistry,
+    diagnostic_set::DiagnosticSet, proto,
 };
 
 use anyhow::{Context as _, Result};
@@ -35,6 +36,7 @@ use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, HighlightStyle, SharedString, StyledText,
     Task, TextStyle,
 };
+use language_core::highlight_cache::{ChunkHighlightCache, ResolvedHighlights};
 
 use lsp::LanguageServerId;
 use parking_lot::Mutex;
@@ -149,28 +151,26 @@ pub struct Buffer {
 #[derive(Debug)]
 pub struct TreeSitterData {
     chunks: RowChunks,
-    brackets_by_chunks: Mutex<HashMap<usize, Vec<BracketMatch>>>,
+    brackets_by_chunks: Mutex<HashMap<RowChunkId, Vec<BracketMatch>>>,
+    highlights_by_chunks: ChunkHighlightCache,
 }
 
-const MAX_ROWS_IN_A_CHUNK: u32 = 50;
-
-/// The maximum length (in bytes) of a line for which syntax highlighting
-/// (tree-sitter capture queries) will be computed. Lines longer than this are
-/// rendered as plain text, mirroring VS Code's
-/// `editor.maxTokenizationLineLength` (which defaults to 20,000 characters) to
-/// avoid pathological performance on very long lines (e.g. minified JSON).
+pub(crate) const MAX_ROWS_IN_A_CHUNK: u32 = 50;
 pub const MAX_HIGHLIGHTED_LINE_LEN: usize = 20_000;
+pub(crate) const MAX_BYTES_TO_HIGHLIGHT_IN_A_CHUNK: usize = 4 * MAX_BYTES_TO_QUERY;
 
 impl TreeSitterData {
     fn clear(&mut self, snapshot: &text::BufferSnapshot) {
         self.chunks = RowChunks::new(snapshot, MAX_ROWS_IN_A_CHUNK);
         self.brackets_by_chunks.get_mut().clear();
+        self.highlights_by_chunks.clear();
     }
 
     fn new(snapshot: &text::BufferSnapshot) -> Self {
         Self {
             chunks: RowChunks::new(snapshot, MAX_ROWS_IN_A_CHUNK),
             brackets_by_chunks: Mutex::new(HashMap::default()),
+            highlights_by_chunks: ChunkHighlightCache::default(),
         }
     }
 
@@ -526,6 +526,27 @@ struct BufferChunkHighlights<'a> {
     highlight_maps: Vec<HighlightMap>,
 }
 
+type HighlightRun = (Range<usize>, HighlightId);
+
+fn subtract_range(range: Range<usize>, excluded: &Range<usize>) -> Vec<Range<usize>> {
+    if excluded.end <= range.start || excluded.start >= range.end {
+        return vec![range];
+    }
+    let mut remaining = Vec::with_capacity(2);
+    if range.start < excluded.start {
+        remaining.push(range.start..excluded.start.min(range.end));
+    }
+    if excluded.end < range.end {
+        remaining.push(excluded.end.max(range.start)..range.end);
+    }
+    remaining
+}
+
+struct CachedChunkHighlightsIter {
+    runs: Vec<HighlightRun>,
+    ix: usize,
+}
+
 /// An iterator that yields chunks of a buffer's text, along with their
 /// syntax highlights and diagnostic status.
 pub struct BufferChunks<'a> {
@@ -540,15 +561,7 @@ pub struct BufferChunks<'a> {
     unnecessary_depth: usize,
     underline: bool,
     highlights: Option<BufferChunkHighlights<'a>>,
-    /// Byte ranges within `range` for which syntax highlighting is skipped
-    /// (very long lines, see [`MAX_HIGHLIGHTED_LINE_LEN`]). While iterating
-    /// within one of these ranges, the tree-sitter capture cursor is not
-    /// advanced, so no tokens are computed for that line.
-    skip_highlights: Option<Vec<Range<usize>>>,
-    /// Set while iterating inside a `skip_highlights` range, indicating that
-    /// the capture cursor must be re-seeked to the current position once the
-    /// iteration leaves the range.
-    needs_capture_reseek: bool,
+    cached_highlights: Option<CachedChunkHighlightsIter>,
 }
 
 /// A chunk of a buffer's text, along with its syntax highlight and
@@ -780,7 +793,6 @@ impl HighlightedTextBuilder {
             range,
             Some((captures, highlight_maps)),
             false,
-            None,
             None,
         )
     }
@@ -1570,6 +1582,7 @@ impl Buffer {
         }
         self.non_text_state_update_count += 1;
         self.syntax_map.lock().clear(&self.text);
+        Self::invalidate_tree_sitter_data(&mut self.tree_sitter_data, self.text.snapshot());
         let old_language = std::mem::replace(&mut self.language, language);
         self.refresh_resolved_settings(cx);
         self.was_changed();
@@ -1695,7 +1708,7 @@ impl Buffer {
 
             anyhow::ensure!(
                 analyze_byte_content(&bytes) != ByteContent::Binary,
-                "不支持二进制文件"
+                "Binary files are not supported"
             );
 
             let is_unicode = target_encoding == encoding_rs::UTF_8
@@ -3553,6 +3566,7 @@ impl Buffer {
 
             snapshot.text = new_text.snapshot.clone();
             snapshot.syntax = syntax;
+            snapshot.tree_sitter_data = Arc::new(TreeSitterData::new(&snapshot.text));
 
             EditedBufferSnapshot {
                 text: new_text,
@@ -4137,14 +4151,19 @@ impl BufferSnapshot {
         let range = range.start.to_offset(self)..range.end.to_offset(self);
 
         let mut syntax = None;
-        let mut skip_highlights = None;
         if language_aware.tree_sitter {
-            // Always create captures for the whole range; lines that are too
-            // long are skipped at the chunk-iteration level via
-            // `skip_highlights`, so they never advance the tree-sitter capture
-            // cursor (see [`BufferChunks::next`]).
-            syntax = Some(self.get_highlights(range.clone()));
-            skip_highlights = self.long_line_highlight_skips(range.clone());
+            match self.cached_highlight_runs(range.clone()) {
+                Some(runs) => {
+                    return BufferChunks::with_cached_highlights(
+                        self.text.as_rope(),
+                        range,
+                        runs,
+                        language_aware.diagnostics,
+                        self,
+                    );
+                }
+                None => syntax = Some(self.get_highlights(range.clone())),
+            }
         }
         BufferChunks::new(
             self.text.as_rope(),
@@ -4152,18 +4171,84 @@ impl BufferSnapshot {
             syntax,
             language_aware.diagnostics,
             Some(self),
-            skip_highlights,
         )
     }
 
-    /// Computes the byte ranges (within `range`) of lines that are too long to
-    /// syntax-highlight. While producing [`BufferChunks`] for these ranges,
-    /// tree-sitter capture queries are skipped so that very long lines (e.g.
-    /// minified JSON) do not incur a per-frame cost proportional to their
-    /// length. This mirrors VS Code's `editor.maxTokenizationLineLength`.
-    fn long_line_highlight_skips(&self, range: Range<usize>) -> Option<Vec<Range<usize>>> {
+    pub(crate) fn cached_highlight_runs(&self, range: Range<usize>) -> Option<Vec<HighlightRun>> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            static DISABLE_HIGHLIGHT_CACHE: std::sync::LazyLock<bool> =
+                std::sync::LazyLock::new(|| {
+                    std::env::var_os("ZED_DISABLE_HIGHLIGHT_CACHE").is_some()
+                });
+            if *DISABLE_HIGHLIGHT_CACHE {
+                return None;
+            }
+        }
+        self.language.as_ref()?.grammar()?;
         if range.is_empty() {
-            return None;
+            return Some(Vec::new());
+        }
+        let skipped_ranges = self.long_line_highlight_skips(range.clone());
+        let mut runs = Vec::<HighlightRun>::new();
+        for chunk in self
+            .tree_sitter_data
+            .chunks
+            .applicable_chunks(&[range.to_point(self)])
+        {
+            let chunk_range = chunk.anchor_range().to_offset(self);
+            if chunk_range.end <= range.start || chunk_range.start >= range.end {
+                continue;
+            }
+            if chunk_range.len() > MAX_BYTES_TO_HIGHLIGHT_IN_A_CHUNK {
+                return None;
+            }
+            let chunk_highlights = match self.tree_sitter_data.highlights_by_chunks.get(chunk.id) {
+                Some(chunk_highlights) => chunk_highlights,
+                None => {
+                    let chunk_highlights = self.compute_chunk_highlights(chunk_range);
+                    self.tree_sitter_data
+                        .highlights_by_chunks
+                        .insert(chunk.id, chunk_highlights.clone());
+                    chunk_highlights
+                }
+            };
+            for (run_range, highlight_id) in chunk_highlights.runs.iter() {
+                if run_range.end <= range.start {
+                    continue;
+                }
+                if run_range.start >= range.end {
+                    break;
+                }
+                let mut fragments = vec![run_range.clone()];
+                for skipped in &skipped_ranges {
+                    fragments = fragments
+                        .into_iter()
+                        .flat_map(|fragment| subtract_range(fragment, skipped))
+                        .collect();
+                    if fragments.is_empty() {
+                        break;
+                    }
+                }
+                for fragment in fragments {
+                    match runs.last_mut() {
+                        Some((last_range, last_highlight_id))
+                            if last_highlight_id == highlight_id
+                                && last_range.end == fragment.start =>
+                        {
+                            last_range.end = fragment.end;
+                        }
+                        _ => runs.push((fragment, *highlight_id)),
+                    }
+                }
+            }
+        }
+        Some(runs)
+    }
+
+    fn long_line_highlight_skips(&self, range: Range<usize>) -> Vec<Range<usize>> {
+        if range.is_empty() {
+            return Vec::new();
         }
         let start_point = self.text.offset_to_point(range.start);
         let end_point = self.text.offset_to_point(range.end);
@@ -4175,7 +4260,44 @@ impl BufferSnapshot {
                 skips.push(start..start + line_len);
             }
         }
-        if skips.is_empty() { None } else { Some(skips) }
+        skips
+    }
+
+    fn compute_chunk_highlights(&self, range: Range<usize>) -> ResolvedHighlights {
+        let captures = self.syntax.captures(range.clone(), &self.text, |grammar| {
+            grammar
+                .highlights_config
+                .as_ref()
+                .map(|config| &config.query)
+        });
+        let sources = captures
+            .grammars()
+            .iter()
+            .map(|&grammar| (Arc::clone(grammar), grammar.highlight_map()))
+            .collect::<SmallVec<[(Arc<Grammar>, HighlightMap); 2]>>();
+        let mut runs = Vec::<(Range<usize>, HighlightId)>::new();
+        for region in flattened_highlight_regions(captures, range) {
+            let highlight_id = region.stack.iter().rev().find_map(|capture| {
+                let (_, highlight_map) = sources.get(capture.grammar_index)?;
+                highlight_map.get(capture.capture_id)
+            });
+            let Some(highlight_id) = highlight_id else {
+                continue;
+            };
+            match runs.last_mut() {
+                Some((last_range, last_highlight_id))
+                    if *last_highlight_id == highlight_id
+                        && last_range.end == region.range.start =>
+                {
+                    last_range.end = region.range.end;
+                }
+                _ => runs.push((region.range, highlight_id)),
+            }
+        }
+        ResolvedHighlights {
+            sources,
+            runs: runs.into(),
+        }
     }
 
     pub fn highlighted_text_for_range<T: ToOffset>(
@@ -5553,18 +5675,41 @@ impl<'a> BufferChunks<'a> {
         syntax: Option<(SyntaxMapCaptures<'a>, Vec<HighlightMap>)>,
         diagnostics: bool,
         buffer_snapshot: Option<&'a BufferSnapshot>,
-        skip_highlights: Option<Vec<Range<usize>>>,
     ) -> Self {
-        let mut highlights = None;
-        if let Some((captures, highlight_maps)) = syntax {
-            highlights = Some(BufferChunkHighlights {
-                captures,
-                next_capture: None,
-                stack: Default::default(),
-                highlight_maps,
-            })
-        }
+        let highlights = syntax.map(|(captures, highlight_maps)| BufferChunkHighlights {
+            captures,
+            next_capture: None,
+            stack: Vec::new(),
+            highlight_maps,
+        });
+        Self::init(text, range, highlights, None, diagnostics, buffer_snapshot)
+    }
 
+    fn with_cached_highlights(
+        text: &'a Rope,
+        range: Range<usize>,
+        runs: Vec<HighlightRun>,
+        diagnostics: bool,
+        buffer_snapshot: &'a BufferSnapshot,
+    ) -> Self {
+        Self::init(
+            text,
+            range,
+            None,
+            Some(CachedChunkHighlightsIter { runs, ix: 0 }),
+            diagnostics,
+            Some(buffer_snapshot),
+        )
+    }
+
+    fn init(
+        text: &'a Rope,
+        range: Range<usize>,
+        highlights: Option<BufferChunkHighlights<'a>>,
+        cached_highlights: Option<CachedChunkHighlightsIter>,
+        diagnostics: bool,
+        buffer_snapshot: Option<&'a BufferSnapshot>,
+    ) -> Self {
         let diagnostic_endpoints = diagnostics.then(|| Vec::new().into_iter().peekable());
         let chunks = text.chunks_in_range(range.clone());
 
@@ -5580,8 +5725,7 @@ impl<'a> BufferChunks<'a> {
             unnecessary_depth: 0,
             underline: true,
             highlights,
-            skip_highlights,
-            needs_capture_reseek: false,
+            cached_highlights,
         };
         this.initialize_diagnostic_endpoints();
         this
@@ -5591,14 +5735,33 @@ impl<'a> BufferChunks<'a> {
     pub fn seek(&mut self, range: Range<usize>) {
         let old_range = std::mem::replace(&mut self.range, range.clone());
         self.chunks.set_range(self.range.clone());
-        // Recompute the highlight skip ranges for the new range. Line lengths
-        // only change on edit, and edits rebuild this iterator, so it is safe
-        // to use the current buffer snapshot here.
-        if let Some(snapshot) = self.buffer_snapshot {
-            self.skip_highlights = snapshot.long_line_highlight_skips(self.range.clone());
-            self.needs_capture_reseek = false;
-        }
-        if let Some(highlights) = self.highlights.as_mut() {
+        if let Some(cached) = self.cached_highlights.as_mut() {
+            if old_range.start <= self.range.start && old_range.end >= self.range.end {
+                cached.ix = cached
+                    .runs
+                    .partition_point(|(run_range, _)| run_range.end <= range.start);
+            } else if let Some(snapshot) = self.buffer_snapshot {
+                if let Some(runs) = snapshot.cached_highlight_runs(self.range.clone()) {
+                    cached.runs = runs;
+                    cached.ix = 0;
+                } else {
+                    let (captures, highlight_maps) = snapshot.get_highlights(self.range.clone());
+                    self.cached_highlights = None;
+                    self.highlights = Some(BufferChunkHighlights {
+                        captures,
+                        next_capture: None,
+                        stack: Vec::new(),
+                        highlight_maps,
+                    });
+                }
+            } else {
+                debug_assert!(
+                    false,
+                    "Attempted to seek on a language-aware buffer iterator without associated buffer snapshot"
+                );
+            }
+            self.initialize_diagnostic_endpoints();
+        } else if let Some(highlights) = self.highlights.as_mut() {
             if old_range.start <= self.range.start && old_range.end >= self.range.end {
                 // Reuse existing highlights stack, as the new range is a subrange of the old one.
                 highlights
@@ -5609,8 +5772,8 @@ impl<'a> BufferChunks<'a> {
                 {
                     let next_capture_end = capture.node.end_byte();
                     if range.start < next_capture_end
-                        && let Some(capture_id) =
-                            highlights.highlight_maps[capture.grammar_index].get(capture.index)
+                        && let Some(capture_id) = highlights.highlight_maps[capture.grammar_index]
+                            .get(CaptureId(capture.index))
                     {
                         highlights.stack.push((next_capture_end, capture_id));
                     }
@@ -5621,7 +5784,7 @@ impl<'a> BufferChunks<'a> {
                 *highlights = BufferChunkHighlights {
                     captures,
                     next_capture: None,
-                    stack: Default::default(),
+                    stack: Vec::new(),
                     highlight_maps,
                 };
             } else {
@@ -5726,60 +5889,49 @@ impl<'a> Iterator for BufferChunks<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let mut next_capture_start = usize::MAX;
         let mut next_diagnostic_endpoint = usize::MAX;
-        let mut next_skip_end = usize::MAX;
 
         if let Some(highlights) = self.highlights.as_mut() {
-            // If the current position is inside a range for which syntax
-            // highlighting is skipped (a very long line), do not advance the
-            // capture cursor: the line is rendered as plain text. Chunks are
-            // truncated at the end of the skip range so that highlighting
-            // resumes right after it; once the iteration leaves the range,
-            // the capture cursor is re-seeked to the current position.
-            let current_skip = self
-                .skip_highlights
-                .as_ref()
-                .and_then(|skips| skips.iter().find(|skip| skip.contains(&self.range.start)));
-            if let Some(skip) = current_skip {
-                highlights.stack.clear();
-                highlights.next_capture = None;
-                self.needs_capture_reseek = true;
-                next_skip_end = skip.end;
-            } else {
-                if self.needs_capture_reseek {
-                    highlights
-                        .captures
-                        .set_byte_range(self.range.start..self.range.end);
-                    highlights.stack.clear();
-                    highlights.next_capture = None;
-                    self.needs_capture_reseek = false;
+            while let Some((parent_capture_end, _)) = highlights.stack.last() {
+                if *parent_capture_end <= self.range.start {
+                    highlights.stack.pop();
+                } else {
+                    break;
                 }
-                while let Some((parent_capture_end, _)) = highlights.stack.last() {
-                    if *parent_capture_end <= self.range.start {
-                        highlights.stack.pop();
-                    } else {
-                        break;
-                    }
-                }
+            }
 
-                if highlights.next_capture.is_none() {
+            if highlights.next_capture.is_none() {
+                highlights.next_capture = highlights.captures.next();
+            }
+
+            while let Some(capture) = highlights.next_capture.as_ref() {
+                if self.range.start < capture.node.start_byte() {
+                    next_capture_start = capture.node.start_byte();
+                    break;
+                } else {
+                    let highlight_id = highlights.highlight_maps[capture.grammar_index]
+                        .get(CaptureId(capture.index));
+                    if let Some(highlight_id) = highlight_id {
+                        highlights
+                            .stack
+                            .push((capture.node.end_byte(), highlight_id));
+                    }
                     highlights.next_capture = highlights.captures.next();
                 }
+            }
+        }
 
-                while let Some(capture) = highlights.next_capture.as_ref() {
-                    if self.range.start < capture.node.start_byte() {
-                        next_capture_start = capture.node.start_byte();
-                        break;
-                    } else {
-                        let highlight_id =
-                            highlights.highlight_maps[capture.grammar_index].get(capture.index);
-                        if let Some(highlight_id) = highlight_id {
-                            highlights
-                                .stack
-                                .push((capture.node.end_byte(), highlight_id));
-                        }
-                        highlights.next_capture = highlights.captures.next();
-                    }
-                }
+        if let Some(cached) = self.cached_highlights.as_mut() {
+            while cached
+                .runs
+                .get(cached.ix)
+                .is_some_and(|(run_range, _)| run_range.end <= self.range.start)
+            {
+                cached.ix += 1;
+            }
+            if let Some((run_range, _)) = cached.runs.get(cached.ix)
+                && self.range.start < run_range.start
+            {
+                next_capture_start = run_range.start;
             }
         }
 
@@ -5808,14 +5960,20 @@ impl<'a> Iterator for BufferChunks<'a> {
             let chunk_start = self.range.start;
             let mut chunk_end = (self.chunks.offset() + chunk.len())
                 .min(next_capture_start)
-                .min(next_diagnostic_endpoint)
-                .min(next_skip_end);
+                .min(next_diagnostic_endpoint);
             let mut highlight_id = None;
             if let Some(highlights) = self.highlights.as_ref()
                 && let Some((parent_capture_end, parent_highlight_id)) = highlights.stack.last()
             {
                 chunk_end = chunk_end.min(*parent_capture_end);
                 highlight_id = Some(*parent_highlight_id);
+            }
+            if let Some(cached) = self.cached_highlights.as_ref()
+                && let Some((run_range, run_highlight_id)) = cached.runs.get(cached.ix)
+                && run_range.start <= chunk_start
+            {
+                chunk_end = chunk_end.min(run_range.end);
+                highlight_id = Some(*run_highlight_id);
             }
             let bit_start = chunk_start - self.chunks.offset();
             let bit_end = chunk_end - self.chunks.offset();

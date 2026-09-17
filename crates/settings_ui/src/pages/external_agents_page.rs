@@ -403,9 +403,24 @@ impl CustomAgentForm {
 
         Self {
             original_id,
-            name: new_input("my-agent（我的 Agent）", name_initial.as_deref(), window, cx),
-            command: new_input("/path/to/agent（Agent 路径）", command_initial.as_deref(), window, cx),
-            args: new_input("--flag value（标志 值）", args_initial.as_deref(), window, cx),
+            name: new_input(
+                "my-agent（我的 Agent）",
+                name_initial.as_deref(),
+                window,
+                cx,
+            ),
+            command: new_input(
+                "/path/to/agent（Agent 路径）",
+                command_initial.as_deref(),
+                window,
+                cx,
+            ),
+            args: new_input(
+                "--flag value（标志 值）",
+                args_initial.as_deref(),
+                window,
+                cx,
+            ),
             env,
             default_mode,
             default_config_options,

@@ -1428,10 +1428,7 @@ mod tests {
         let mut values = values(McpTransport::Http);
         values.url = "not a url".into();
         let error = build_settings_from_values(&values).unwrap_err();
-        assert!(
-            error.starts_with("无效的 URL"),
-            "unexpected error: {error}"
-        );
+        assert!(error.starts_with("无效的 URL"), "unexpected error: {error}");
     }
 
     #[test]

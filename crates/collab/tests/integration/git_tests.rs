@@ -908,7 +908,7 @@ async fn test_remote_git_graph_data_and_search(
     assert!(!local_search_results.is_empty());
     assert_eq!(remote_search_results, local_search_results);
 
-    let remote_repository = cx_b.update(|cx| project_b.read(cx).active_repository(cx).unwrap());
+    let remote_repository = cx_b.update(|_, cx| project_b.read(cx).active_repository(cx).unwrap());
     let (author_result_tx, author_result_rx) = async_channel::unbounded();
     remote_repository.update(cx_b, |repository, cx| {
         repository.search_commits(

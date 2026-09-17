@@ -1469,7 +1469,9 @@ mod tests {
         let selected = vec![
             project::ProjectPath {
                 worktree_id: worktree,
-                path: util::rel_path::RelPath::from_unix_str("src").unwrap().into(),
+                path: util::rel_path::RelPath::from_unix_str("src")
+                    .unwrap()
+                    .into(),
             },
             project::ProjectPath {
                 worktree_id: worktree,
@@ -1499,7 +1501,11 @@ mod tests {
             path("src/deep/module.rs"),
             Some(&selected)
         ));
-        assert!(path_is_within_scan_selection(worktree, path("any.rs"), None));
+        assert!(path_is_within_scan_selection(
+            worktree,
+            path("any.rs"),
+            None
+        ));
     }
 
     #[test]
@@ -2694,7 +2700,9 @@ fn show_project_scan_confirmation(
     .into();
     let scan_running = project_scan_state(&project, cx).read(cx).running;
     let error = if scan_running {
-        Some(SharedString::from("当前项目已有完整扫描正在运行，请等待完成或先停止扫描。"))
+        Some(SharedString::from(
+            "当前项目已有完整扫描正在运行，请等待完成或先停止扫描。",
+        ))
     } else {
         (resolve_model(&settings, cx).is_err() || !settings.cache_persist)
             .then(|| SharedString::from("请先选择可用的代码讲解渠道和模型，并开启持久缓存。"))
