@@ -16,6 +16,8 @@ pub mod blink_manager;
 mod bracket_colorization;
 mod clangd_ext;
 pub mod code_context_menus;
+mod code_explanation_units;
+pub mod code_explanations;
 mod code_lens;
 pub mod display_map;
 mod document_colors;
@@ -30,6 +32,7 @@ mod git;
 mod highlight_matching_bracket;
 pub mod hover_links;
 pub mod hover_popover;
+pub mod hover_translation;
 mod indent_guides;
 mod inlays;
 mod inline_input;
@@ -47,6 +50,7 @@ mod selections_collection;
 pub mod semantic_tokens;
 mod split;
 pub mod split_editor_view;
+mod translation_cache;
 
 mod bookmarks;
 #[cfg(test)]
@@ -75,6 +79,7 @@ mod rewrap;
 mod selection;
 
 pub(crate) use actions::*;
+pub use actions::{DeepExplainSelection, RunCode, RunFile, RunSelection, StopCode};
 pub use clipboard::ClipboardSelection;
 pub use code_actions::CodeActionProvider;
 use collections::TypeIdHashMap;
@@ -231,7 +236,8 @@ use project::{
 use rand::seq::SliceRandom;
 use regex::Regex;
 use rpc::{ErrorCode, ErrorExt, proto::PeerId};
-use scroll::{Autoscroll, ScrollAnchor, ScrollManager, SharedScrollAnchor};
+pub(crate) use scroll::Autoscroll;
+use scroll::{ScrollAnchor, ScrollManager, SharedScrollAnchor};
 use selections_collection::{MutableSelectionsCollection, SelectionsCollection};
 use serde::{Deserialize, Serialize};
 use settings::{
@@ -325,9 +331,9 @@ enum ReportEditorEvent {
 impl ReportEditorEvent {
     pub fn event_type(&self) -> &'static str {
         match self {
-            Self::Saved { .. } => "Editor Saved",
-            Self::EditorOpened => "Editor Opened",
-            Self::Closed => "Editor Closed",
+            Self::Saved { .. } => "编辑器已保存",
+            Self::EditorOpened => "编辑器已打开",
+            Self::Closed => "编辑器已关闭",
         }
     }
 }
@@ -1072,6 +1078,7 @@ pub struct Editor {
     leader_id: Option<CollaboratorId>,
     remote_id: Option<ViewId>,
     pub hover_state: HoverState,
+    pub(crate) explanations: code_explanations::ExplanationState,
     pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
     prev_pressure_stage: Option<PressureStage>,
     gutter_hovered: bool,
@@ -1684,8 +1691,8 @@ enum GutterButtonIntent {
 impl GutterButtonIntent {
     fn as_str(&self) -> &'static str {
         match self {
-            Self::SetBookmark => "Set Bookmark",
-            Self::SetBreakpoint => "Set Breakpoint",
+            Self::SetBookmark => "设置书签",
+            Self::SetBreakpoint => "设置断点",
         }
     }
 
@@ -2050,14 +2057,6 @@ impl Editor {
                 project,
                 window,
                 |editor, _, event, window, cx| match event {
-                    project::Event::RemoteIdChanged(Some(_))
-                    | project::Event::Reshared
-                    | project::Event::HostReshared => {
-                        // The per-change selection broadcast is skipped while the
-                        // project is unshared, so re-publish current selections
-                        // once it becomes (re)shared.
-                        editor.republish_active_selections(window, cx);
-                    }
                     project::Event::RefreshCodeLens { .. } => {
                         editor.refresh_code_lenses(None, window, cx);
                     }
@@ -2430,6 +2429,7 @@ impl Editor {
             leader_id: None,
             remote_id: None,
             hover_state: HoverState::default(),
+            explanations: code_explanations::ExplanationState::default(),
             pending_mouse_down: None,
             prev_pressure_stage: None,
             hovered_link_state: None,
@@ -2938,7 +2938,7 @@ impl Editor {
         cx: &mut Context<Workspace>,
     ) {
         Self::new_in_workspace(workspace, window, cx).detach_and_prompt_err(
-            "Failed to create buffer",
+            "创建缓冲区失败",
             window,
             cx,
             |e, _, _| match e.error_code() {
@@ -3026,7 +3026,7 @@ impl Editor {
             })?;
             anyhow::Ok(())
         })
-        .detach_and_prompt_err("Failed to create buffer", window, cx, |e, _, _| {
+        .detach_and_prompt_err("创建缓冲区失败", window, cx, |e, _, _| {
             match e.error_code() {
                 ErrorCode::RemoteUpgradeRequired => Some(format!(
                 "The remote instance of Zed does not support this yet. It must be upgraded to {}",
@@ -4290,9 +4290,9 @@ impl Editor {
             }))
             .tooltip(move |_window, cx| {
                 Tooltip::with_meta_in(
-                    "Remove Bookmark",
+                    "移除书签",
                     Some(&ToggleBookmark),
-                    SharedString::from("Right-click for more options"),
+                    SharedString::from("右键点击查看更多选项"),
                     &focus_handle,
                     cx,
                 )
@@ -4438,10 +4438,10 @@ impl Editor {
         let toggle_state_entry: Option<(&str, Box<dyn Action>)> =
             breakpoint.as_ref().map(|bp| match bp.1.state {
                 BreakpointState::Enabled => {
-                    ("Disable", crate::actions::DisableBreakpoint.boxed_clone())
+                    ("禁用", crate::actions::DisableBreakpoint.boxed_clone())
                 }
                 BreakpointState::Disabled => {
-                    ("Enable", crate::actions::EnableBreakpoint.boxed_clone())
+                    ("启用", crate::actions::EnableBreakpoint.boxed_clone())
                 }
             });
 
@@ -4454,7 +4454,7 @@ impl Editor {
                 .when_some(
                     clear_runnable_task_status,
                     |this, (buffer_id, buffer_row)| {
-                        this.entry("Clear Run Status", None, {
+                        this.entry("清除运行状态", None, {
                             let weak_editor = weak_editor.clone();
                             move |_window, cx| {
                                 weak_editor
@@ -4470,7 +4470,7 @@ impl Editor {
                 .when(run_to_cursor, |this| {
                     let weak_editor = weak_editor.clone();
                     this.entry(
-                        "Run to Cursor",
+                        "运行到光标",
                         Some(RunToCursor.boxed_clone()),
                         move |window, cx| {
                             weak_editor
@@ -4610,7 +4610,7 @@ impl Editor {
                 })
                 .when(has_bookmark, |this| {
                     this.entry(
-                        "Edit Bookmark",
+                        "编辑书签",
                         Some(EditBookmark.boxed_clone()),
                         move |window, cx| {
                             weak_editor
@@ -4662,7 +4662,7 @@ impl Editor {
         let has_context_menu = self.has_mouse_context_menu();
 
         let meta = if is_rejected {
-            SharedString::from("No executable code is associated with this line.")
+            SharedString::from("此行没有可执行的代码。")
         } else if !breakpoint.is_disabled() {
             SharedString::from(format!(
                 "{alt_as_text}-click to disable\nright-click for more options"
@@ -5798,21 +5798,20 @@ impl Editor {
                             .collect::<String>();
 
                         if !line_text_after_indent.is_empty() {
-                            let block_prefixes = language_scope
+                            let block_prefix = language_scope
                                 .block_comment()
-                                .into_iter()
-                                .chain(language_scope.documentation_comment())
-                                .filter(|comment| {
-                                    language_scope.override_name() == Some("comment")
-                                        && !comment.prefix.is_empty()
-                                        && !line_text_after_indent.starts_with(comment.end.as_ref())
-                                })
-                                .map(|comment| comment.prefix.as_ref());
+                                .map(|c| c.prefix.as_ref())
+                                .filter(|p| !p.is_empty());
+                            let doc_prefix = language_scope
+                                .documentation_comment()
+                                .map(|c| c.prefix.as_ref())
+                                .filter(|p| !p.is_empty());
                             let comment_prefixes = language_scope
                                 .line_comment_prefixes()
                                 .iter()
                                 .map(|p| p.as_ref())
-                                .chain(block_prefixes)
+                                .chain(block_prefix)
+                                .chain(doc_prefix)
                                 .map(|prefix| (prefix, false));
                             let all_prefixes = comment_prefixes.chain(
                                 language_scope
@@ -6187,7 +6186,7 @@ impl Editor {
             BreakpointPromptEditAction::Condition => {
                 "Condition when a breakpoint is hit. Expressions within {} are interpolated."
             }
-            BreakpointPromptEditAction::HitCondition => "How many breakpoint hits to ignore",
+            BreakpointPromptEditAction::HitCondition => "忽略多少个断点命中",
         };
 
         let breakpoint = breakpoint.clone();
@@ -6834,14 +6833,13 @@ impl Editor {
                     .map(|(i, &row)| (row, i))
                     .collect();
 
-                let mut old_line_end = 0;
-                let mut new_line_end = 0;
-                let mut new_line_starts = Vec::new();
-                for (range, text) in line_ranges.iter().zip(&line_texts) {
-                    let line_start = new_line_end + (range.start.0 - old_line_end);
-                    new_line_starts.push(line_start);
-                    old_line_end = range.end.0;
-                    new_line_end = line_start + text.len();
+                // Compute new line start offsets after rotation (handles CRLF)
+                let newline_len = line_ranges[1].start.0 - line_ranges[0].end.0;
+                let first_line_start = line_ranges[0].start.0;
+                let mut new_line_starts: Vec<usize> = vec![first_line_start];
+                for text in line_texts.iter().take(num_rows - 1) {
+                    let prev_start = *new_line_starts.last().unwrap();
+                    new_line_starts.push(prev_start + text.len() + newline_len);
                 }
 
                 let new_selections = selections
@@ -9932,6 +9930,9 @@ impl Editor {
                 edited_buffer,
                 source,
             } => {
+                if self.explanations.version.is_some() {
+                    code_explanations::code_edited(self, cx);
+                }
                 self.scrollbar_marker_state.dirty = true;
                 self.active_indent_guides_state.dirty = true;
                 self.fit_gutter_line_number_width(false, cx);
@@ -10177,6 +10178,9 @@ impl Editor {
     }
 
     fn settings_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.explanations.version.is_some() {
+            code_explanations::clear(self, cx);
+        }
         let new_language_settings = self.fetch_applicable_language_settings(cx);
         let language_settings_changed = new_language_settings != self.applicable_language_settings;
         self.applicable_language_settings = new_language_settings;
@@ -10870,6 +10874,7 @@ impl Editor {
     }
 
     pub fn handle_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        code_explanations::request_refresh(self);
         self.cursor_animations.clear();
         self.blink_manager.update(cx, BlinkManager::disable);
         self.buffer
@@ -11656,28 +11661,11 @@ pub trait CollaborationHub {
     fn collaborators<'a>(&self, cx: &'a App) -> &'a HashMap<PeerId, Collaborator>;
     fn user_participant_indices<'a>(&self, cx: &'a App) -> &'a HashMap<u64, ParticipantIndex>;
     fn user_names(&self, cx: &App) -> HashMap<u64, SharedString>;
-
-    /// Whether local selection changes need to be broadcast to other
-    /// participants. Defaults to `true`; hubs that can be certain there is no
-    /// audience (e.g. an unshared local project) override this so the editor can
-    /// skip the per-keystroke `set_active_selections` work, which is
-    /// `O(selections)` and pure overhead when nobody is observing.
-    fn should_broadcast_selections(&self, _: &App) -> bool {
-        true
-    }
 }
 
 impl CollaborationHub for Entity<Project> {
     fn collaborators<'a>(&self, cx: &'a App) -> &'a HashMap<PeerId, Collaborator> {
         self.read(cx).collaborators()
-    }
-
-    fn should_broadcast_selections(&self, cx: &App) -> bool {
-        // `is_shared()` is true for a host that has shared the project and for a
-        // collab guest, and stays correct even before peer-join notifications
-        // have propagated locally (unlike a live collaborator count). A purely
-        // local project has no audience, so selections need not be broadcast.
-        self.read(cx).is_shared()
     }
 
     fn user_participant_indices<'a>(&self, cx: &'a App) -> &'a HashMap<u64, ParticipantIndex> {
@@ -12363,7 +12351,14 @@ impl Focusable for Editor {
 }
 
 impl Render for Editor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if code_explanations::CodeExplanationSettings::get_global(cx).enabled
+            || self.explanations.version.is_some()
+        {
+            cx.defer_in(window, |editor, window, cx| {
+                code_explanations::schedule(editor, window, cx);
+            });
+        }
         EditorElement::new(&cx.entity(), self.create_style(cx))
     }
 }
@@ -12913,7 +12908,7 @@ impl PromptEditor {
             .icon_color(Color::Muted)
             .shape(IconButtonShape::Square)
             .tooltip(move |_window, cx| {
-                Tooltip::for_action_in("Cancel", &menu::Cancel, &focus_handle, cx)
+                Tooltip::for_action_in("取消", &menu::Cancel, &focus_handle, cx)
             })
             .on_click(cx.listener(|this, _, window, cx| {
                 this.cancel(&menu::Cancel, window, cx);
@@ -12926,7 +12921,7 @@ impl PromptEditor {
             .icon_color(Color::Muted)
             .shape(IconButtonShape::Square)
             .tooltip(move |_window, cx| {
-                Tooltip::for_action_in("Confirm", &menu::Confirm, &focus_handle, cx)
+                Tooltip::for_action_in("确认", &menu::Confirm, &focus_handle, cx)
             })
             .on_click(cx.listener(|this, _, window, cx| {
                 this.confirm(&menu::Confirm, window, cx);

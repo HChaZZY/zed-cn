@@ -70,7 +70,6 @@ pub struct ProjectDiff {
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     diff: Entity<DiffMultibuffer>,
-    _diff_event_subscription: Subscription,
     _diff_observation: Subscription,
 }
 
@@ -267,18 +266,12 @@ impl ProjectDiff {
         workspace: Entity<Workspace>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let diff_event_subscription = cx.subscribe(&diff, |_, _, event: &EditorEvent, cx| {
-            if event == &(EditorEvent::SelectionsChanged { local: true }) {
-                cx.emit(event.clone())
-            }
-        });
-        let diff_observation = cx.observe(&diff, |_, _, cx| cx.notify());
+        let observation = cx.observe(&diff, |_, _, cx| cx.notify());
         Self {
             project,
             workspace: workspace.downgrade(),
             diff,
-            _diff_event_subscription: diff_event_subscription,
-            _diff_observation: diff_observation,
+            _diff_observation: observation,
         }
     }
 
@@ -872,7 +865,7 @@ impl Render for ProjectDiffToolbar {
                 h_group_sm()
                     .when(button_states.selection, |this| {
                         this.child(
-                            Button::new("stage", "Toggle Staged")
+                            Button::new("stage", "切换暂存状态")
                                 .tooltip(Tooltip::for_action_title_in(
                                     "Toggle Staged",
                                     &ToggleStaged,
@@ -886,7 +879,7 @@ impl Render for ProjectDiffToolbar {
                     })
                     .when(!button_states.selection, |this| {
                         this.child(
-                            Button::new("stage", "Stage")
+                            Button::new("stage", "暂存")
                                 .disabled(!button_states.stage)
                                 .tooltip(Tooltip::for_action_title_in(
                                     "Stage and Go to Next Hunk",
@@ -898,7 +891,7 @@ impl Render for ProjectDiffToolbar {
                                 })),
                         )
                         .child(
-                            Button::new("unstage", "Unstage")
+                            Button::new("unstage", "取消暂存")
                                 .disabled(!button_states.unstage)
                                 .tooltip(Tooltip::for_action_title_in(
                                     "Unstage and Go to Next Hunk",
@@ -916,7 +909,7 @@ impl Render for ProjectDiffToolbar {
                 button_states.unstage_all && !button_states.stage_all,
                 |this| {
                     this.child(
-                        Button::new("unstage-all", "Unstage All")
+                        Button::new("unstage-all", "取消全部暂存")
                             .width(stage_all_button_width)
                             .tooltip(Tooltip::for_action_title_in(
                                 "Unstage All Changes",
@@ -933,7 +926,7 @@ impl Render for ProjectDiffToolbar {
                 !button_states.unstage_all || button_states.stage_all,
                 |this| {
                     this.child(
-                        Button::new("stage-all", "Stage All")
+                        Button::new("stage-all", "全部暂存")
                             .width(stage_all_button_width)
                             .disabled(!button_states.stage_all)
                             .tooltip(Tooltip::for_action_title_in(
@@ -949,12 +942,8 @@ impl Render for ProjectDiffToolbar {
             )
             .child(Divider::vertical())
             .child(
-                Button::new("commit", "Commit")
-                    .tooltip(Tooltip::for_action_title_in(
-                        "Commit",
-                        &Commit,
-                        &focus_handle,
-                    ))
+                Button::new("commit", "提交")
+                    .tooltip(Tooltip::for_action_title_in("提交", &Commit, &focus_handle))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.dispatch_action(&Commit, window, cx);
                     })),
@@ -1567,20 +1556,8 @@ mod tests {
         );
 
         let project = Project::test(fs, [Path::new(path!("/a"))], cx).await;
-        let (created_entry_id, changed_entry_id) = project.read_with(cx, |project, cx| {
-            let entry_id = |path| {
-                let project_path = project
-                    .find_project_path(path, cx)
-                    .expect("diff path should resolve");
-                project
-                    .entry_for_path(&project_path, cx)
-                    .expect("diff path should have a project entry")
-                    .id
-            };
-            (entry_id(path!("/a/a.txt")), entry_id(path!("/a/b.txt")))
-        });
         let (multi_workspace, cx) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
 
         cx.run_until_parked();
@@ -1610,10 +1587,6 @@ mod tests {
             ˇcreated
         "
         ));
-        assert_eq!(
-            project.read_with(&cx.cx, |project, _| project.active_entry()),
-            Some(created_entry_id)
-        );
 
         cx.dispatch_action(editor::actions::GoToPreviousHunk);
 
@@ -1628,10 +1601,6 @@ mod tests {
             created
         "
         ));
-        assert_eq!(
-            project.read_with(&cx.cx, |project, _| project.active_entry()),
-            None
-        );
 
         cx.dispatch_action(editor::actions::GoToPreviousHunk);
 
@@ -1646,42 +1615,6 @@ mod tests {
             created
         "
         ));
-        assert_eq!(
-            project.read_with(&cx.cx, |project, _| project.active_entry()),
-            Some(changed_entry_id)
-        );
-
-        cx.cx.update(|_, cx| {
-            cx.update_global::<SettingsStore, _>(|store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.editor.diff_view_style = Some(DiffViewStyle::Split);
-                });
-            });
-        });
-        cx.cx.run_until_parked();
-
-        let lhs_editor = item.read_with(&cx.cx, |item, cx| {
-            item.editor(cx)
-                .read(cx)
-                .lhs_editor()
-                .cloned()
-                .expect("split diff should have a left editor")
-        });
-        let mut lhs_cx = EditorTestContext::for_editor_in(lhs_editor, &mut cx.cx).await;
-        lhs_cx.update_editor(|editor, window, cx| {
-            editor.change_selections(Default::default(), window, cx, |selections| {
-                selections.select_ranges([multi_buffer::Anchor::Max..multi_buffer::Anchor::Max]);
-            });
-        });
-        lhs_cx.update_editor(|editor, window, cx| {
-            editor.change_selections(Default::default(), window, cx, |selections| {
-                selections.select_ranges([multi_buffer::Anchor::Min..multi_buffer::Anchor::Min]);
-            });
-        });
-        assert_eq!(
-            project.read_with(&lhs_cx.cx, |project, _| project.active_entry()),
-            Some(changed_entry_id)
-        );
     }
 
     #[gpui::test]

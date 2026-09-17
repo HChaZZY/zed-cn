@@ -32,6 +32,7 @@ use collections::{FxHashMap, FxHashSet};
 #[cfg(target_os = "macos")]
 use core_video::pixel_buffer::CVPixelBuffer;
 use derive_more::{Deref, DerefMut};
+use futures::FutureExt;
 use futures::channel::oneshot;
 use gpui_util::post_inc;
 use gpui_util::{ResultExt, measure};
@@ -266,6 +267,10 @@ impl WindowInvalidator {
 
     pub fn not_drawing(&self) -> bool {
         self.inner.borrow().draw_phase == DrawPhase::None
+    }
+
+    pub fn has_dirty_views(&self) -> bool {
+        !self.inner.borrow().dirty_views.is_empty()
     }
 
     #[track_caller]
@@ -3149,6 +3154,12 @@ impl Window {
         self.reset_cursor_style(cx);
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
+        // Invalidations raised after this draw drained `dirty_views` were not applied to
+        // the frame being built. Re-arm the window so they cannot remain pending until
+        // unrelated platform input requests another frame.
+        if self.invalidator.has_dirty_views() {
+            self.refresh();
+        }
         // Focus listeners may move focus (e.g. a dock forwarding focus to its active
         // panel). `Window::focus` suppresses `refresh` while a draw is in progress, so
         // schedule another frame here to render the new focus state and dispatch the
@@ -3851,7 +3862,25 @@ impl Window {
     /// Note that the multiple calls to this method will only result in one `Asset::load` call at a
     /// time.
     pub fn use_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
-        cx.asset_entry::<A>(source).use_by(self.current_view())
+        let (task, is_first) = cx.fetch_asset::<A>(source);
+        task.clone().now_or_never().or_else(|| {
+            if is_first {
+                let entity_id = self.current_view();
+                self.spawn(cx, {
+                    let task = task.clone();
+                    async move |cx| {
+                        task.await;
+
+                        cx.on_next_frame(move |_, cx| {
+                            cx.notify(entity_id);
+                        });
+                    }
+                })
+                .detach();
+            }
+
+            None
+        })
     }
 
     /// Asynchronously load an asset, if the asset hasn't finished loading or doesn't exist this will return None.
@@ -3860,7 +3889,8 @@ impl Window {
     /// Note that the multiple calls to this method will only result in one `Asset::load` call at a
     /// time.
     pub fn get_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
-        cx.fetch_asset::<A>(source)
+        let (task, _) = cx.fetch_asset::<A>(source);
+        task.now_or_never()
     }
     /// Obtain the current element offset. This method should only be called during the
     /// prepaint phase of element drawing.
@@ -7365,6 +7395,8 @@ mod tests {
         time::Duration,
     };
 
+    use collections::FxHashSet;
+
     use crate::{
         AnyWindowHandle, AppContext as _, Bounds, Context, DispatchPhase, DragMoveEvent, Empty,
         ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
@@ -7526,6 +7558,66 @@ mod tests {
         assert!(
             test_window.frame_wake_count() > baseline,
             "scheduling a next-frame callback in an idle window must wake the frame source"
+        );
+    }
+
+    struct InvalidatesDuringPaint {
+        render_count: Rc<Cell<usize>>,
+        invalidate: Rc<Cell<bool>>,
+    }
+
+    impl Render for InvalidatesDuringPaint {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.render_count.set(self.render_count.get() + 1);
+            let this = cx.entity();
+            let invalidate = self.invalidate.clone();
+            canvas(
+                |_, _, _| {},
+                move |_, _, _, cx| {
+                    if invalidate.replace(false) {
+                        this.update(cx, |_, cx| cx.notify());
+                    }
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn test_invalidation_during_draw_requests_a_follow_up_frame() {
+        let mut cx = TestAppContext::single();
+        let render_count = Rc::new(Cell::new(0));
+        let invalidate = Rc::new(Cell::new(false));
+        let window = cx.add_window({
+            let render_count = render_count.clone();
+            let invalidate = invalidate.clone();
+            move |_, _| InvalidatesDuringPaint {
+                render_count,
+                invalidate,
+            }
+        });
+
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        invalidate.set(true);
+        cx.update_window(window.into(), |root, window, cx| {
+            window.invalidator.set_dirty(true);
+            window
+                .invalidator
+                .replace_views(FxHashSet::from_iter([root.entity_id()]));
+            window.draw(cx).clear(cx);
+            assert!(
+                window.invalidator.is_dirty(),
+                "an invalidation raised during draw must keep frame demand armed"
+            );
+        })
+        .unwrap();
+
+        let render_count_after_draw = render_count.get();
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        assert!(
+            render_count.get() > render_count_after_draw,
+            "the follow-up frame must consume the draw-time invalidation"
         );
     }
 

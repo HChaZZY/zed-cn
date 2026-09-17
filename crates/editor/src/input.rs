@@ -500,12 +500,11 @@ impl Editor {
                 this.show_edit_predictions_in_menu() || !had_active_edit_prediction;
             if this.hard_wrap.is_some() {
                 let latest: Range<Point> = this.selections.newest(&map).range();
-                // Reuse the post-edit snapshot captured in `map` above; the buffer
-                // is not mutated between there and here (only selections move), so a
-                // fresh `buffer().snapshot(cx)` would be redundant.
                 if latest.is_empty()
-                    && map
-                        .buffer_snapshot()
+                    && this
+                        .buffer()
+                        .read(cx)
+                        .snapshot(cx)
                         .line_len(MultiBufferRow(latest.start.row))
                         == latest.start.column
                 {

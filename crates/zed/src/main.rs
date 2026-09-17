@@ -2,7 +2,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod reliability;
-mod watcher_debug;
 mod zed;
 
 // Ensure the binary name stays in sync with APP_NAME so that the paths used
@@ -133,7 +132,7 @@ fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>) {
                             gpui::PromptLevel::Critical,
                             message,
                             Some(&error_details),
-                            &["Exit"],
+                            &["退出"],
                             cx,
                         );
 
@@ -298,9 +297,6 @@ fn main() {
         };
     }
     ztracing::init();
-
-    #[cfg(unix)]
-    util::increase_open_file_limit().log_err();
 
     let version = option_env!("ZED_BUILD_ID");
     let app_commit_sha =
@@ -490,6 +486,9 @@ fn main() {
         zed_actions::init();
 
         release_channel::init(app_version, cx);
+        if let Some(tag) = option_env!("ZED_CUSTOM_RELEASE_TAG") {
+            cx.set_global(release_channel::CustomReleaseTag(tag.to_owned()));
+        }
         gpui_tokio::init(cx);
         if let Some(app_commit_sha) = app_commit_sha {
             AppCommitSha::set_global(app_commit_sha, cx);
@@ -654,7 +653,6 @@ fn main() {
         });
         AppState::set_global(app_state.clone(), cx);
 
-        watcher_debug::init(app_state.clone(), cx);
         auto_update::init(client.clone(), cx);
         dap_adapters::init(cx);
         auto_update_ui::init(cx);

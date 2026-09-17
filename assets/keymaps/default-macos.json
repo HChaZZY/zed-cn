@@ -69,6 +69,7 @@
       "ctrl-y": "editor::KillRingYank",
       "cmd-k cmd-q": "editor::Rewrap",
       "cmd-k q": "editor::Rewrap",
+      "ctrl-alt-t": "editor::TranslateSelection",
       "cmd-backspace": "editor::DeleteToBeginningOfLine",
       "cmd-delete": "editor::DeleteToEndOfLine",
       "alt-backspace": ["editor::DeleteToPreviousWordStart", { "ignore_newlines": false, "ignore_brackets": false }],
@@ -146,6 +147,8 @@
       "cmd-i": "editor::ShowSignatureHelp",
       "f9": "editor::ToggleBreakpoint",
       "shift-f9": "editor::EditLogBreakpoint",
+      // 有选区时运行选中代码，否则保存并运行当前文件。
+      "ctrl-alt-n": "editor::RunCode",
       "ctrl-f12": "editor::GoToDeclaration",
       "alt-ctrl-f12": "editor::GoToDeclarationSplit",
       "ctrl-cmd-e": "editor::ToggleEditPrediction",
@@ -262,6 +265,13 @@
       "cmd-shift-e": "project_panel::ToggleFocus",
       "ctrl-tab": "agents_sidebar::ToggleThreadSwitcher",
       "ctrl-shift-tab": ["agents_sidebar::ToggleThreadSwitcher", { "select_last": true }],
+    },
+  },
+  {
+    "context": "AgentPanel > Markdown",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-c": "markdown::CopyAsMarkdown",
     },
   },
   {
@@ -781,6 +791,10 @@
       // Use the `"reevaluate_context"` parameter to control this.
       "cmd-alt-r": ["task::Rerun", { "reevaluate_context": false }],
       "ctrl-alt-shift-r": ["task::Spawn", { "reveal_target": "center" }],
+      // Spawns the task tagged "run-current" (e.g. a "run current file" task);
+      // falls back to the task picker when no matching task is found.
+      "ctrl-alt-m": ["task::Spawn", { "task_tag": "run-current" }],
+      "ctrl-alt-shift-j": "editor::StopCode",
       // also possible to spawn tasks by name:
       // "foo-bar": ["task::Spawn", { "task_name": "MyTask", "reveal_target": "dock" }]
       // or by tag:
@@ -1294,13 +1308,6 @@
     "use_key_equivalents": true,
     "bindings": {
       "cmd-shift-i": "search::ToggleIncludeIgnored",
-    },
-  },
-  {
-    "context": "CommandPalette || (CommandPalette > Picker > Editor)",
-    "use_key_equivalents": true,
-    "bindings": {
-      "shift-backspace": "command_palette::RemoveSelected",
     },
   },
   {

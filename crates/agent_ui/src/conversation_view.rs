@@ -34,9 +34,7 @@ use gpui::{
     linear_gradient, list, pulsating_between,
 };
 use language::{Buffer, Language, Rope};
-use language_model::{
-    LanguageModelCompletionError, ProviderErrorCategory, ZED_CLOUD_PROVIDER_NAME,
-};
+use language_model::{LanguageModelCompletionError, ProviderErrorCategory};
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle,
 };
@@ -124,7 +122,7 @@ enum ThreadFeedback {
 
 #[derive(Debug)]
 pub(crate) enum ThreadError {
-    ZedPaymentRequired,
+    PaymentRequired,
     DataRetentionConsentRequired,
     Refusal,
     AuthenticationRequired(SharedString),
@@ -188,11 +186,7 @@ impl From<anyhow::Error> for ThreadError {
                         provider: provider.to_string().into(),
                     },
                     ProviderErrorCategory::PromptTooLarge { .. } => Self::PromptTooLarge,
-                    ProviderErrorCategory::PaymentRequired
-                        if provider == &ZED_CLOUD_PROVIDER_NAME =>
-                    {
-                        Self::ZedPaymentRequired
-                    }
+                    ProviderErrorCategory::PaymentRequired => Self::PaymentRequired,
                     ProviderErrorCategory::Authentication => Self::AuthenticationFailed {
                         provider: provider.to_string().into(),
                     },
@@ -205,7 +199,6 @@ impl From<anyhow::Error> for ThreadError {
                     },
                     ProviderErrorCategory::InvalidEncryptedContent
                     | ProviderErrorCategory::ContentPolicy
-                    | ProviderErrorCategory::PaymentRequired
                     | ProviderErrorCategory::InvalidRequest
                     | ProviderErrorCategory::Conflict
                     | ProviderErrorCategory::Timeout
@@ -1670,11 +1663,11 @@ impl ConversationView {
                 self.load_subagent_session(subagent_session_id.clone(), session_id, window, cx)
             }
             AcpThreadEvent::ToolAuthorizationRequested(_) => {
-                self.notify_with_sound("Waiting for tool confirmation", IconName::Info, window, cx);
+                self.notify_with_sound("等待工具确认", IconName::Info, window, cx);
             }
             AcpThreadEvent::ToolAuthorizationReceived(_) => {}
             AcpThreadEvent::ElicitationRequested(_) => {
-                self.notify_with_sound("Waiting for input", IconName::Info, window, cx);
+                self.notify_with_sound("等待输入", IconName::Info, window, cx);
             }
             AcpThreadEvent::ElicitationResponded(_) => {}
             AcpThreadEvent::Retry(retry) => {
@@ -1776,12 +1769,7 @@ impl ConversationView {
                     });
                 }
                 if !is_subagent {
-                    self.notify_with_sound(
-                        "Agent stopped due to an error",
-                        IconName::Warning,
-                        window,
-                        cx,
-                    );
+                    self.notify_with_sound("Agent 因错误而停止", IconName::Warning, window, cx);
                 }
             }
             AcpThreadEvent::LoadError(error) => {
@@ -2345,7 +2333,7 @@ impl ConversationView {
                     .map(|this| {
                         if show_fallback_description {
                             this.child(
-                                Label::new("Choose one of the following authentication options:")
+                                Label::new("请选择以下认证方式之一：")
                                     .size(LabelSize::Small)
                                     .color(Color::Muted),
                             )
@@ -2740,23 +2728,23 @@ impl ConversationView {
             } => {
                 return self.render_unsupported(path, current_version, minimum_version, window, cx);
             }
-            LoadError::FailedToInstall(msg) => ("Failed to Install", msg.to_string()),
+            LoadError::FailedToInstall(msg) => ("安装失败", msg.to_string()),
             LoadError::Exited { status, stderr } => {
-                let mut message = format!("Server exited with status {status}");
+                let mut message = format!("服务进程已退出，状态为 {status}");
                 if let Some(stderr) = stderr {
                     message.push_str("\n");
                     message.push_str(stderr);
                 };
-                ("Failed to Launch", message)
+                ("启动失败", message)
             }
-            LoadError::Other(msg) => ("Failed to Launch", msg.to_string()),
+            LoadError::Other(msg) => ("启动失败", msg.to_string()),
         };
 
         let action_slot = h_flex()
             .gap_1()
             .child(
-                Button::new("retry-agent-launch", "Retry")
-                    .tooltip(Tooltip::text("Try to restart the agent"))
+                Button::new("retry-agent-launch", "重试")
+                    .tooltip(Tooltip::text("尝试重新启动 Agent"))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.retry_connection(window, cx);
                     })),
@@ -3243,7 +3231,7 @@ impl ConversationView {
     fn create_copy_button(&self, message: impl Into<String>) -> impl IntoElement {
         let message = message.into();
 
-        CopyButton::new("copy-error-message", message).tooltip_label("Copy Error Message")
+        CopyButton::new("copy-error-message", message).tooltip_label("复制错误消息")
     }
 
     pub(crate) fn reauthenticate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3755,56 +3743,6 @@ pub(crate) mod tests {
             ThreadError::ProviderRejection { message }
                 if message == "This content was flagged as potentially violating our terms of use."
         ));
-    }
-
-    #[test]
-    fn test_payment_required_preserves_non_zed_provider_message() {
-        for provider in [
-            language_model::LanguageModelProviderName::new("OpenRouter"),
-            language_model::OPEN_AI_PROVIDER_NAME,
-            language_model::ANTHROPIC_PROVIDER_NAME,
-        ] {
-            for status in [None, Some(http_client::StatusCode::PAYMENT_REQUIRED)] {
-                let provider_error = LanguageModelCompletionError::from_provider_response(
-                    provider.clone(),
-                    status,
-                    Some("402".to_string()),
-                    "Insufficient credits. Add credits to your account.".to_string(),
-                    None,
-                    ProviderErrorCategory::PaymentRequired,
-                );
-
-                let error = ThreadError::from(anyhow!(provider_error));
-
-                assert!(
-                    matches!(
-                        &error,
-                        ThreadError::ProviderRejection { message }
-                            if message == "Insufficient credits. Add credits to your account."
-                    ),
-                    "expected provider billing message for {provider}, got: {error:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_payment_required_from_zed_uses_upgrade_prompt() {
-        let provider_error = LanguageModelCompletionError::from_provider_response(
-            ZED_CLOUD_PROVIDER_NAME,
-            Some(http_client::StatusCode::PAYMENT_REQUIRED),
-            None,
-            "Payment required".to_string(),
-            None,
-            ProviderErrorCategory::PaymentRequired,
-        );
-
-        let error = ThreadError::from(anyhow!(provider_error));
-
-        assert!(
-            matches!(error, ThreadError::ZedPaymentRequired),
-            "expected Zed upgrade prompt, got: {error:?}"
-        );
     }
 
     #[gpui::test]

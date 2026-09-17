@@ -18,7 +18,7 @@ use gpui::{
 use language::{Anchor, Buffer, HighlightedText, OffsetRangeExt as _, Point};
 use multi_buffer::{MultiBuffer, PathKey, excerpt_context_lines};
 use project::{
-    Project, ProjectPath,
+    Project,
     git_store::{Repository, RepositoryId},
 };
 use settings::{Settings, SettingsStore, StatusStyle};
@@ -453,10 +453,6 @@ impl Item for SoloDiffView {
         self.editor.for_each_project_item(cx, f)
     }
 
-    fn active_project_path(&self, cx: &App) -> Option<ProjectPath> {
-        self.editor.read(cx).active_project_path(cx)
-    }
-
     fn set_nav_history(
         &mut self,
         nav_history: ItemNavHistory,
@@ -814,7 +810,7 @@ impl Render for SoloDiffGitToolbar {
                 h_group_sm()
                     .when(button_states.selection, |el| {
                         el.child(
-                            Button::new("stage", "Toggle Staged")
+                            Button::new("stage", "切换暂存状态")
                                 .disabled(!button_states.stage && !button_states.unstage)
                                 .tooltip(Tooltip::for_action_title_in(
                                     "Toggle Staged",
@@ -828,7 +824,7 @@ impl Render for SoloDiffGitToolbar {
                     })
                     .when(!button_states.selection, |el| {
                         el.child(
-                            Button::new("stage", "Stage")
+                            Button::new("stage", "暂存")
                                 .disabled(!button_states.stage)
                                 .tooltip(Tooltip::for_action_title_in(
                                     "Stage and Go to Next Hunk",
@@ -840,7 +836,7 @@ impl Render for SoloDiffGitToolbar {
                                 })),
                         )
                         .child(
-                            Button::new("unstage", "Unstage")
+                            Button::new("unstage", "取消暂存")
                                 .disabled(!button_states.unstage)
                                 .tooltip(Tooltip::for_action_title_in(
                                     "Unstage and Go to Next Hunk",
@@ -853,7 +849,7 @@ impl Render for SoloDiffGitToolbar {
                         )
                     })
                     .child(
-                        Button::new("restore", "Restore")
+                        Button::new("restore", "恢复")
                             .tooltip(Tooltip::for_action_title_in(
                                 "Restore selected hunk",
                                 &Restore,
@@ -867,7 +863,7 @@ impl Render for SoloDiffGitToolbar {
             )
             .child(Divider::vertical())
             .child(h_group_sm().child(if button_states.stage_file {
-                Button::new("stage-file", "Stage All")
+                Button::new("stage-file", "全部暂存")
                     .width(rems_from_px(80_f32))
                     .disabled(!button_states.stage_file)
                     .tooltip(Tooltip::for_action_title_in(
@@ -877,7 +873,7 @@ impl Render for SoloDiffGitToolbar {
                     ))
                     .on_click(cx.listener(|this, _, window, cx| this.stage_file(window, cx)))
             } else {
-                Button::new("unstage-file", "Unstage All")
+                Button::new("unstage-file", "取消全部暂存")
                     .width(rems_from_px(80_f32))
                     .disabled(!button_states.unstage_file)
                     .tooltip(Tooltip::for_action_title_in(
@@ -889,7 +885,7 @@ impl Render for SoloDiffGitToolbar {
             }))
             .child(Divider::vertical())
             .child(
-                Button::new("commit", "Commit")
+                Button::new("commit", "提交")
                     .tooltip(Tooltip::for_action_title_in(
                         "Commit",
                         &Commit,

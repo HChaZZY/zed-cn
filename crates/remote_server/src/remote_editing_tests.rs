@@ -184,36 +184,6 @@ async fn test_basic_remote_editing(cx: &mut TestAppContext, server_cx: &mut Test
     buffer.update(cx, |buffer, _| {
         assert_eq!(&**buffer.file().unwrap().path(), rel_path("src/lib2.rs"));
     });
-    let renamed_buffer = project
-        .update(cx, |project, cx| {
-            project.open_buffer((worktree_id, rel_path("src/lib2.rs")), cx)
-        })
-        .await
-        .unwrap();
-    assert_eq!(renamed_buffer, buffer);
-
-    fs.insert_file(
-        path!("/code/project1/src/lib.rs"),
-        b"fn two() -> usize { 2 }".to_vec(),
-    )
-    .await;
-    cx.run_until_parked();
-
-    let recreated_buffer = project
-        .update(cx, |project, cx| {
-            project.open_buffer((worktree_id, rel_path("src/lib.rs")), cx)
-        })
-        .await
-        .unwrap();
-    assert_ne!(recreated_buffer, buffer);
-    recreated_buffer.read_with(cx, |buffer, _| {
-        assert_eq!(&**buffer.file().unwrap().path(), rel_path("src/lib.rs"));
-        assert_eq!(buffer.text(), "fn two() -> usize { 2 }");
-    });
-    buffer.read_with(cx, |buffer, _| {
-        assert_eq!(&**buffer.file().unwrap().path(), rel_path("src/lib2.rs"));
-        assert_eq!(buffer.text(), "fn one() -> usize { 100 }");
-    });
 
     fs.set_index_for_repo(
         Path::new(path!("/code/project1/.git")),
@@ -226,68 +196,6 @@ async fn test_basic_remote_editing(cx: &mut TestAppContext, server_cx: &mut Test
             "fn one() -> usize { 100 }"
         );
     });
-}
-
-#[gpui::test]
-async fn test_remote_buffer_path_swap(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
-    let fs = FakeFs::new(server_cx.executor());
-    fs.insert_tree(
-        path!("/code/project"),
-        json!({ "a.txt": "first", "b.txt": "second" }),
-    )
-    .await;
-    let (project, headless) = init_test(&fs, cx, server_cx).await;
-    let session = headless.read_with(server_cx, |headless, _| headless.session.clone());
-    let (worktree, _) = project
-        .update(cx, |project, cx| {
-            project.find_or_create_worktree(path!("/code/project"), true, cx)
-        })
-        .await
-        .unwrap();
-    let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
-    let first_buffer = project
-        .update(cx, |project, cx| {
-            project.open_buffer((worktree_id, rel_path("a.txt")), cx)
-        })
-        .await
-        .unwrap();
-    let second_buffer = project
-        .update(cx, |project, cx| {
-            project.open_buffer((worktree_id, rel_path("b.txt")), cx)
-        })
-        .await
-        .unwrap();
-    cx.run_until_parked();
-
-    for updates in [
-        [(&first_buffer, "b.txt"), (&second_buffer, "a.txt")],
-        [(&second_buffer, "b.txt"), (&first_buffer, "a.txt")],
-    ] {
-        for (buffer, path) in updates {
-            let message = buffer.read_with(cx, |buffer, cx| {
-                let mut file = buffer.file().unwrap().to_proto(cx);
-                file.path = path.to_owned();
-                proto::UpdateBufferFile {
-                    project_id: proto::REMOTE_SERVER_PROJECT_ID,
-                    buffer_id: buffer.remote_id().to_proto(),
-                    file: Some(file),
-                }
-            });
-            session.send(message).unwrap();
-            cx.run_until_parked();
-        }
-        for (buffer, path) in updates {
-            buffer.read_with(cx, |buffer, _| {
-                assert_eq!(&**buffer.file().unwrap().path(), rel_path(path));
-            });
-            project.read_with(cx, |project, cx| {
-                assert_eq!(
-                    project.get_open_buffer(&(worktree_id, rel_path(path)).into(), cx),
-                    Some(buffer.clone())
-                );
-            });
-        }
-    }
 }
 
 #[gpui::test]
@@ -340,6 +248,13 @@ async fn test_remote_telemetry_event_forwarding(
             |_, cx| cx.on_release(|_, _| drop(headless))
         })
         .detach();
+
+    // Forwarding is opt-in; do not rely on the application's privacy defaults.
+    cx.update_global(|settings_store: &mut SettingsStore, cx| {
+        settings_store.set_user_settings(r#"{"telemetry":{"metrics":true}}"#, cx)
+    })
+    .expect("enable metrics for forwarding test");
+    cx.run_until_parked();
 
     // The remote server forwards a bare `FlexibleEvent` as JSON; mirror that
     // here by sending the proto message the forwarding task would send.
@@ -2871,6 +2786,20 @@ async fn test_reconnect(cx: &mut TestAppContext, server_cx: &mut TestAppContext)
     });
 
     let client = cx.read(|cx| project.read(cx).remote_client().unwrap());
+    let reconnect_status_seen = Arc::new(AtomicBool::new(false));
+    let _status_subscription = cx.update(|cx| {
+        let reconnect_status_seen = reconnect_status_seen.clone();
+        cx.observe(&client, move |client, cx| {
+            let client = client.read(cx);
+            if client.connection_state() == remote::ConnectionState::Reconnecting
+                && client
+                    .reconnect_status()
+                    .is_some_and(|status| !status.is_empty())
+            {
+                reconnect_status_seen.store(true, Ordering::SeqCst);
+            }
+        })
+    });
     let reconnected = Arc::new(AtomicBool::new(false));
     let _subscription = cx.update(|cx| {
         let reconnected = reconnected.clone();
@@ -2901,6 +2830,8 @@ async fn test_reconnect(cx: &mut TestAppContext, server_cx: &mut TestAppContext)
         reconnected.load(Ordering::SeqCst),
         "a successful reconnect should emit RemoteClientEvent::Reconnected"
     );
+    assert!(reconnect_status_seen.load(Ordering::SeqCst));
+    client.read_with(cx, |client, _| assert!(!client.was_manual_reconnect()));
 }
 
 #[gpui::test]
@@ -3041,15 +2972,22 @@ async fn test_copy_file_into_remote_project(
         )
         .await;
 
+    let transferred_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observer = transferred_entries.clone();
     worktree
         .update(cx, |worktree, cx| {
-            worktree.copy_external_entries(
+            worktree.copy_external_entries_with_progress(
                 rel_path("src").into(),
                 vec![
                     Path::new(path!("/local-code/dir1/file1")).into(),
                     Path::new(path!("/local-code/dir1/dir2")).into(),
                 ],
                 local_fs.clone(),
+                Some(Arc::new(move |event| {
+                    if matches!(event, worktree::FileTransferProgress::Finished) {
+                        observer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                })),
                 cx,
             )
         })
@@ -3073,6 +3011,10 @@ async fn test_copy_file_into_remote_project(
             PathBuf::from(path!("/code/project1/src/dir2/file2")),
             PathBuf::from(path!("/code/project1/src/dir2/dir3/file3")),
         ]
+    );
+    assert_eq!(
+        transferred_entries.load(std::sync::atomic::Ordering::SeqCst),
+        6
     );
     assert_eq!(
         remote_fs

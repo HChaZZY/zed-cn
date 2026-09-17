@@ -66,6 +66,7 @@
       "shift-tab": "editor::Backtab",
       "ctrl-k ctrl-q": "editor::Rewrap",
       "ctrl-k q": "editor::Rewrap",
+      "ctrl-alt-t": "editor::TranslateSelection",
       "ctrl-backspace": ["editor::DeleteToPreviousWordStart", { "ignore_newlines": false, "ignore_brackets": false }],
       "ctrl-delete": ["editor::DeleteToNextWordEnd", { "ignore_newlines": false, "ignore_brackets": false }],
       "shift-delete": "editor::Cut",
@@ -122,6 +123,8 @@
       "ctrl-alt-e": "editor::ToggleEditPrediction",
       "f9": "editor::ToggleBreakpoint",
       "shift-f9": "editor::EditLogBreakpoint",
+      // 有选区时运行选中代码，否则保存并运行当前文件。
+      "ctrl-alt-n": "editor::RunCode",
     },
   },
   {
@@ -226,6 +229,13 @@
       "ctrl-shift-e": "project_panel::ToggleFocus",
       "ctrl-tab": "agents_sidebar::ToggleThreadSwitcher",
       "ctrl-shift-tab": ["agents_sidebar::ToggleThreadSwitcher", { "select_last": true }],
+    },
+  },
+  {
+    "context": "AgentPanel > Markdown",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-c": "markdown::CopyAsMarkdown",
     },
   },
   {
@@ -711,6 +721,10 @@
       "alt-t": "task::Rerun",
       "shift-alt-t": "task::Spawn",
       "shift-alt-r": ["task::Spawn", { "reveal_target": "center" }],
+      // Spawns the task tagged "run-current" (e.g. a "run current file" task);
+      // falls back to the task picker when no matching task is found.
+      "ctrl-alt-m": ["task::Spawn", { "task_tag": "run-current" }],
+      "ctrl-alt-shift-j": "editor::StopCode",
       // also possible to spawn tasks by name:
       // "foo-bar": ["task::Spawn", { "task_name": "MyTask", "reveal_target": "dock" }]
       // or by tag:
@@ -1250,13 +1264,6 @@
     "bindings": {
       "ctrl-p": "file_finder::Toggle",
       "ctrl-shift-i": "search::ToggleIncludeIgnored",
-    },
-  },
-  {
-    "context": "CommandPalette || (CommandPalette > Picker > Editor)",
-    "use_key_equivalents": true,
-    "bindings": {
-      "shift-backspace": "command_palette::RemoveSelected",
     },
   },
   {

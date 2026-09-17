@@ -530,24 +530,6 @@ When enabled, this setting will automatically close tabs for files that have bee
 }
 ```
 
-## Command Palette
-
-### Use Command History
-
-- Description: Whether to use command history ranking for sorting in the command palette.
-- Setting: `command_palette.use_command_history`
-- Default: `true`
-
-Disabling this setting does not erase history.
-
-```json [settings]
-{
-  "command_palette": {
-    "use_command_history": false
-  }
-}
-```
-
 ## Confirm Quit
 
 - Description: Whether or not to prompt the user to confirm before closing the application.
@@ -3593,7 +3575,7 @@ Examples:
 ## Preview tabs
 
 - Description:
-  Preview tabs allow you to open files in preview mode. A pane keeps at most one preview tab at a time, so opening another file in preview mode takes over that slot. Switching to a file that is already open does not close the preview tab. This is useful for quickly viewing files without cluttering your workspace. Preview tabs display their file names in italics. \
+  Preview tabs allow you to open files in preview mode, where they close automatically when you switch to another file unless you explicitly pin them. This is useful for quickly viewing files without cluttering your workspace. Preview tabs display their file names in italics. \
   There are several ways to convert a preview tab into a regular tab:
 
   - Double-clicking on the file
@@ -3601,8 +3583,6 @@ Examples:
   - Using the {#action project_panel::OpenPermanent} action
   - Editing the file
   - Dragging the file to a different pane
-  - Pinning the tab with the {#action pane::TogglePinTab} action
-  - Using the {#action pane::TogglePreviewTab} action
 
 - Setting: `preview_tabs`
 - Default:

@@ -6,7 +6,7 @@ use editor::{
 use git_ui_core::file_diff_view::build_buffer_diff;
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable, Font,
-    IntoElement, Render, SharedString, Subscription, Task, Window,
+    IntoElement, Render, SharedString, Task, Window,
 };
 use language::{Buffer, Capability, HighlightedText, OffsetRangeExt};
 use multi_buffer::PathKey;
@@ -28,7 +28,6 @@ use workspace::{
 pub struct MultiDiffView {
     editor: Entity<Editor>,
     file_count: usize,
-    _editor_event_subscription: Subscription,
 }
 
 struct Entry {
@@ -205,17 +204,7 @@ impl MultiDiffView {
             editor
         });
 
-        let editor_event_subscription = cx.subscribe(&editor, |_, _, event: &EditorEvent, cx| {
-            if event == &(EditorEvent::SelectionsChanged { local: true }) {
-                cx.emit(event.clone())
-            }
-        });
-
-        Self {
-            editor,
-            file_count,
-            _editor_event_subscription: editor_event_subscription,
-        }
+        Self { editor, file_count }
     }
 
     fn title(&self) -> SharedString {
