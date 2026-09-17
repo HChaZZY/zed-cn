@@ -2500,10 +2500,16 @@ impl SettingsWindow {
         fn split_into_words(parts: &[&str]) -> Vec<String> {
             parts
                 .iter()
-                .flat_map(|s| {
-                    s.split(|c: char| !c.is_alphanumeric())
-                        .filter(|w| !w.is_empty())
-                        .map(|w| w.to_lowercase())
+                .flat_map(|part| {
+                    let mut words = part
+                        .split(|character: char| !character.is_alphanumeric())
+                        .filter(|word| !word.is_empty())
+                        .map(str::to_lowercase)
+                        .collect::<Vec<_>>();
+                    if let Some(initials) = fuzzy::PinyinInitials::from_text(part) {
+                        words.extend(initials.variants().map(|(variant, _)| variant.to_string()));
+                    }
+                    words
                 })
                 .collect()
         }
@@ -2519,6 +2525,11 @@ impl SettingsWindow {
         ) {
             for word in input.split_ascii_whitespace() {
                 fuzzy_match_candidates.push(StringMatchCandidate::new(key_index, word));
+            }
+            if let Some(initials) = fuzzy::PinyinInitials::from_text(input) {
+                for (variant, _) in initials.variants() {
+                    fuzzy_match_candidates.push(StringMatchCandidate::new(key_index, variant));
+                }
             }
         }
 
@@ -5695,11 +5706,16 @@ pub mod test {
     fn settings_search_matches_substrings() {
         let document = SearchDocument {
             id: 0,
-            words: vec!["无障碍".to_string(), "模式".to_string()],
+            words: vec![
+                "无障碍".to_string(),
+                "模式".to_string(),
+                "wzams".to_string(),
+            ],
         };
 
         assert!(search_document_matches(&document, &["障碍"]));
         assert!(search_document_matches(&document, &["模式"]));
+        assert!(search_document_matches(&document, &["wzam"]));
         assert!(!search_document_matches(&document, &["显示"]));
     }
 

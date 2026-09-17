@@ -978,7 +978,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                 .open_folders
                 .iter()
                 .enumerate()
-                .map(|(id, folder)| StringMatchCandidate::new(id, folder.name.as_ref()))
+                .map(|(id, folder)| StringMatchCandidate::new_with_pinyin(id, folder.name.as_ref()))
                 .collect();
 
             match_strings(

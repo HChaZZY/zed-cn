@@ -3,7 +3,7 @@ use crate::code_explanation_units::{
 };
 use crate::{Autoscroll, BlockPlacement, BlockProperties, BlockStyle, Editor};
 use anyhow::{Context as _, Result};
-use collections::HashSet;
+use collections::{HashMap, HashSet};
 use futures::{StreamExt as _, stream::FuturesUnordered};
 use gpui::{
     Action as _, App, Context, DismissEvent, EventEmitter, FocusHandle, Focusable, IntoElement,
@@ -25,9 +25,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use text::ToPoint as _;
-use ui::{
-    Indicator, Modal, ModalHeader, Section, SpinnerLabel, Tooltip, WithScrollbar, prelude::*,
-};
+use ui::{Modal, ModalHeader, Section, SpinnerLabel, Tooltip, WithScrollbar, prelude::*};
 use util::ResultExt;
 use workspace::ModalView;
 
@@ -53,49 +51,57 @@ fn shared_result(key: &str, value: Option<SharedString>) -> Option<SharedString>
 
 static CACHE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-static ACTIVE_REQUESTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-static ACTIVE_REQUEST_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static WAITERS: std::sync::Mutex<Vec<(u64, String, u8, std::time::Instant)>> =
+static ACTIVE_REQUESTS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<gpui::EntityId, Vec<String>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::default()));
+static WAITERS: std::sync::Mutex<Vec<(u64, gpui::EntityId, String, u8, std::time::Instant)>> =
     std::sync::Mutex::new(Vec::new());
 static NEXT_WAITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct RequestWaiter(u64);
 impl RequestWaiter {
-    fn new(key: String, priority: u8) -> Result<Self> {
+    fn new(scope: gpui::EntityId, key: String, priority: u8) -> Result<Self> {
         let identifier = NEXT_WAITER.fetch_add(1, Ordering::SeqCst);
         WAITERS
             .lock()
             .map_err(|_| anyhow::anyhow!("讲解队列不可用"))?
-            .push((identifier, key, priority, std::time::Instant::now()));
+            .push((identifier, scope, key, priority, std::time::Instant::now()));
         Ok(Self(identifier))
     }
 
     fn acquire(&self, maximum: usize) -> Option<RequestPermit> {
         let waiters = WAITERS.lock().ok()?;
-        let active = ACTIVE_REQUESTS.lock().ok()?;
+        let active_requests = ACTIVE_REQUESTS.lock().ok()?;
+        let (_, scope, _, _, _) = waiters
+            .iter()
+            .find(|(identifier, _, _, _, _)| *identifier == self.0)?;
+        let active = active_requests
+            .get(scope)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         if active.len() >= maximum {
             return None;
         }
-        // Aging bounds priority starvation; occupied keys must not block unrelated requests.
-        let next = next_waiter(&waiters, &active);
-        let (identifier, key, _, _) = next?;
+        let next = next_waiter(&waiters, *scope, active);
+        let (identifier, scope, key, _, _) = next?;
         if *identifier != self.0 {
             return None;
         }
+        let scope = *scope;
         let key = key.clone();
-        drop(active);
-        RequestPermit::acquire(key, maximum)
+        drop(active_requests);
+        RequestPermit::acquire(scope, key, maximum)
     }
 }
 fn next_waiter<'a>(
-    waiters: &'a [(u64, String, u8, std::time::Instant)],
+    waiters: &'a [(u64, gpui::EntityId, String, u8, std::time::Instant)],
+    scope: gpui::EntityId,
     active: &[String],
-) -> Option<&'a (u64, String, u8, std::time::Instant)> {
+) -> Option<&'a (u64, gpui::EntityId, String, u8, std::time::Instant)> {
     waiters
         .iter()
-        .filter(|(_, key, _, _)| !active.contains(key))
-        .min_by_key(|(identifier, _, priority, entered)| {
+        .filter(|(_, waiter_scope, key, _, _)| *waiter_scope == scope && !active.contains(key))
+        .min_by_key(|(identifier, _, _, priority, entered)| {
             let effective = if entered.elapsed() >= std::time::Duration::from_secs(5) {
                 0
             } else {
@@ -108,7 +114,7 @@ fn next_waiter<'a>(
 impl Drop for RequestWaiter {
     fn drop(&mut self) {
         if let Ok(mut waiters) = WAITERS.lock() {
-            waiters.retain(|(identifier, _, _, _)| *identifier != self.0);
+            waiters.retain(|(identifier, _, _, _, _)| *identifier != self.0);
         }
     }
 }
@@ -123,6 +129,7 @@ struct ProjectScanCandidate {
 #[derive(Default)]
 struct ProjectScanState {
     running: bool,
+    project_label: SharedString,
     cancelled: Arc<AtomicBool>,
     total_files: usize,
     completed_files: usize,
@@ -133,29 +140,128 @@ struct ProjectScanState {
     diagnostics: Vec<String>,
 }
 
-struct GlobalProjectScan(gpui::Entity<ProjectScanState>);
+#[derive(Default)]
+pub struct CodeExplanationFileIndex {
+    files: HashSet<(gpui::EntityId, project::ProjectPath)>,
+}
 
-impl gpui::Global for GlobalProjectScan {}
+struct GlobalCodeExplanationFileIndex(gpui::Entity<CodeExplanationFileIndex>);
 
-struct RequestPermit(String);
+impl gpui::Global for GlobalCodeExplanationFileIndex {}
+
+pub fn code_explanation_file_index(cx: &mut App) -> gpui::Entity<CodeExplanationFileIndex> {
+    if let Some(index) = cx.try_global::<GlobalCodeExplanationFileIndex>() {
+        return index.0.clone();
+    }
+    let index = cx.new(|_| CodeExplanationFileIndex::default());
+    cx.set_global(GlobalCodeExplanationFileIndex(index.clone()));
+    index
+}
+
+impl CodeExplanationFileIndex {
+    pub fn contains(
+        &self,
+        project: &gpui::Entity<project::Project>,
+        path: &project::ProjectPath,
+    ) -> bool {
+        self.files.contains(&(project.entity_id(), path.clone()))
+    }
+}
+
+fn mark_explained_file(
+    project: &gpui::Entity<project::Project>,
+    path: project::ProjectPath,
+    cx: &mut App,
+) {
+    let project_id = project.entity_id();
+    code_explanation_file_index(cx).update(cx, |index, cx| {
+        if index.files.insert((project_id, path)) {
+            cx.notify();
+        }
+    });
+}
+
+pub async fn load_code_explanation_file_index(
+    project: gpui::Entity<project::Project>,
+    cx: &mut gpui::AsyncApp,
+) -> Result<()> {
+    let databases = project.read_with(cx, |project, cx| {
+        project
+            .visible_worktrees(cx)
+            .map(|worktree| {
+                let worktree = worktree.read(cx);
+                let namespace = format!(
+                    "{:?}:{:?}",
+                    worktree.abs_path(),
+                    project.remote_connection_options(cx)
+                );
+                (
+                    worktree.id(),
+                    paths::data_dir()
+                        .join("code-explanations")
+                        .join(format!("{}.sqlite", content_hash(&namespace))),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    let files = cx
+        .background_spawn(async move {
+            let mut files = Vec::new();
+            for (worktree_id, database) in databases {
+                for path in cached_file_paths(&database)? {
+                    if let Ok(path) = util::rel_path::RelPath::from_unix_str(&path) {
+                        files.push(project::ProjectPath {
+                            worktree_id,
+                            path: path.into(),
+                        });
+                    }
+                }
+            }
+            anyhow::Ok(files)
+        })
+        .await?;
+    cx.update(|cx| {
+        for path in files {
+            mark_explained_file(&project, path, cx);
+        }
+    });
+    Ok(())
+}
+
+#[derive(Default)]
+struct ProjectScanRegistry {
+    scans: HashMap<gpui::EntityId, gpui::Entity<ProjectScanState>>,
+}
+
+struct GlobalProjectScans(gpui::Entity<ProjectScanRegistry>);
+
+impl gpui::Global for GlobalProjectScans {}
+
+struct RequestPermit {
+    scope: gpui::EntityId,
+    key: String,
+}
 impl RequestPermit {
-    fn acquire(key: String, maximum: usize) -> Option<Self> {
-        let mut active = ACTIVE_REQUESTS.lock().ok()?;
+    fn acquire(scope: gpui::EntityId, key: String, maximum: usize) -> Option<Self> {
+        let mut active_requests = ACTIVE_REQUESTS.lock().ok()?;
+        let active = active_requests.entry(scope).or_default();
         if active.len() >= maximum || active.contains(&key) {
             return None;
         }
         active.push(key.clone());
-        ACTIVE_REQUEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Some(Self(key))
+        Some(Self { scope, key })
     }
 }
 impl Drop for RequestPermit {
     fn drop(&mut self) {
-        if let Ok(mut active) = ACTIVE_REQUESTS.lock()
-            && let Some(index) = active.iter().position(|key| key == &self.0)
+        if let Ok(mut active_requests) = ACTIVE_REQUESTS.lock()
+            && let Some(active) = active_requests.get_mut(&self.scope)
+            && let Some(index) = active.iter().position(|key| key == &self.key)
         {
             active.remove(index);
-            ACTIVE_REQUEST_COUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            if active.is_empty() {
+                active_requests.remove(&self.scope);
+            }
         }
     }
 }
@@ -225,13 +331,38 @@ pub(crate) struct ExplanationState {
     pub deep_explanation_creases: Vec<crate::CreaseId>,
 }
 
-fn project_scan_state(cx: &mut App) -> gpui::Entity<ProjectScanState> {
-    if let Some(state) = cx.try_global::<GlobalProjectScan>() {
-        return state.0.clone();
+fn project_scan_registry(cx: &mut App) -> gpui::Entity<ProjectScanRegistry> {
+    if let Some(registry) = cx.try_global::<GlobalProjectScans>() {
+        return registry.0.clone();
+    }
+    let registry = cx.new(|_| ProjectScanRegistry::default());
+    cx.set_global(GlobalProjectScans(registry.clone()));
+    registry
+}
+
+fn project_scan_state(
+    project: &gpui::Entity<project::Project>,
+    cx: &mut App,
+) -> gpui::Entity<ProjectScanState> {
+    let project_id = project.entity_id();
+    let registry = project_scan_registry(cx);
+    if let Some(state) = registry.read(cx).scans.get(&project_id) {
+        return state.clone();
     }
     let state = cx.new(|_| ProjectScanState::default());
-    cx.set_global(GlobalProjectScan(state.clone()));
+    registry.update(cx, |registry, cx| {
+        registry.scans.insert(project_id, state.clone());
+        cx.notify();
+    });
     state
+}
+
+fn active_request_count(scope: gpui::EntityId) -> usize {
+    ACTIVE_REQUESTS
+        .lock()
+        .ok()
+        .and_then(|requests| requests.get(&scope).map(Vec::len))
+        .unwrap_or_default()
 }
 
 fn resolve_model(settings: &CodeExplanationSettings, cx: &App) -> Result<ConfiguredModel> {
@@ -599,6 +730,7 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
         .language()
         .map(|language| language.name().to_string())
         .unwrap_or_default();
+    let project_path = buffer.read(cx).project_path(cx);
     let cache_namespace = format!(
         "{:?}:{:?}",
         worktree.read(cx).abs_path(),
@@ -734,7 +866,8 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
             };
             let request_key = format!("{cache_namespace}:{key}");
             let permit = if cached.is_none() {
-                let waiting = match RequestWaiter::new(request_key.clone(), 1) {
+                let waiting = match RequestWaiter::new(project.entity_id(), request_key.clone(), 1)
+                {
                     Ok(waiting) => waiting,
                     Err(error) => {
                         log::error!("{error}");
@@ -833,18 +966,44 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
                 let key = key.clone();
                 let budget = settings.cache_max_bytes;
                 let write_generation = write_generation.clone();
+                let cache_path_for_write = cache_path.clone();
                 if let Err(error) = cx
                     .background_spawn(async move {
-                        cache_access_guarded(&cache_path, &key, Some(&text), budget, || {
-                            write_generation.load(std::sync::atomic::Ordering::SeqCst)
-                                == expected_write_generation
-                                && CACHE_EPOCH.load(std::sync::atomic::Ordering::SeqCst) == epoch
-                        })
+                        cache_access_guarded(
+                            &cache_path_for_write,
+                            &key,
+                            Some(&text),
+                            budget,
+                            || {
+                                write_generation.load(std::sync::atomic::Ordering::SeqCst)
+                                    == expected_write_generation
+                                    && CACHE_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+                                        == epoch
+                            },
+                        )
                     })
                     .await
                 {
                     log::warn!("代码讲解缓存写入失败：{error}");
                 }
+            }
+            if result.is_ok()
+                && let Some(project_path) = &project_path
+            {
+                if settings.cache_persist {
+                    let cache_path = cache_path.clone();
+                    let file_path = project_path.path.as_unix_str().to_owned();
+                    let key = key.clone();
+                    if let Err(error) = cx
+                        .background_spawn(
+                            async move { cache_mark_file(&cache_path, &file_path, &key) },
+                        )
+                        .await
+                    {
+                        log::warn!("代码讲解文件标记写入失败：{error}");
+                    }
+                }
+                cx.update(|cx| mark_explained_file(&project, project_path.clone(), cx));
             }
             drop(permit);
             this.update(cx, |_, cx| cx.notify()).ok();
@@ -956,6 +1115,54 @@ fn retain_pending_units(
     completed: &HashSet<std::ops::Range<usize>>,
 ) {
     units.retain(|unit| !completed.contains(&unit.range));
+}
+
+fn cached_file_paths(path: &std::path::Path) -> Result<Vec<String>> {
+    use db::sqlez::{connection::Connection, statement::Statement};
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let _guard = CACHE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("讲解缓存锁不可用"))?;
+    let connection = Connection::open_file(path.to_str().context("缓存路径编码无效")?);
+    if !connection.persistent() {
+        return Ok(Vec::new());
+    }
+    let exists = Statement::prepare(
+        &connection,
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='explained_files'",
+    )?
+    .rows::<String>()?
+    .into_iter()
+    .next()
+    .is_some();
+    if !exists {
+        return Ok(Vec::new());
+    }
+    Statement::prepare(
+        &connection,
+        "SELECT DISTINCT explained_files.path FROM explained_files INNER JOIN explanations ON explanations.key = explained_files.key",
+    )?
+    .rows::<String>()
+}
+
+fn cache_mark_file(path: &std::path::Path, file_path: &str, key: &str) -> Result<()> {
+    use db::sqlez::{connection::Connection, statement::Statement};
+    let _guard = CACHE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("讲解缓存锁不可用"))?;
+    let connection = Connection::open_file(path.to_str().context("缓存路径编码无效")?);
+    anyhow::ensure!(connection.persistent(), "无法打开持久缓存，当前仅使用内存");
+    Statement::prepare(&connection, "CREATE TABLE IF NOT EXISTS explained_files (path TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY(path, key))")?.exec()?;
+    let mut insert = Statement::prepare(
+        &connection,
+        "INSERT OR REPLACE INTO explained_files VALUES (?1, ?2)",
+    )?;
+    insert.bind_text(1, file_path)?;
+    insert.bind_text(2, key)?;
+    insert.exec()?;
+    Ok(())
 }
 
 fn cache_access(
@@ -1256,6 +1463,46 @@ mod tests {
     }
 
     #[test]
+    fn selected_scan_paths_include_files_and_recursive_directories() {
+        let worktree = project::WorktreeId::from_proto(1);
+        let other_worktree = project::WorktreeId::from_proto(2);
+        let selected = vec![
+            project::ProjectPath {
+                worktree_id: worktree,
+                path: util::rel_path::RelPath::from_unix_str("src").unwrap().into(),
+            },
+            project::ProjectPath {
+                worktree_id: worktree,
+                path: util::rel_path::RelPath::from_unix_str("exact.rs")
+                    .unwrap()
+                    .into(),
+            },
+        ];
+        let path = |value| util::rel_path::RelPath::from_unix_str(value).unwrap();
+        assert!(path_is_within_scan_selection(
+            worktree,
+            path("src/deep/module.rs"),
+            Some(&selected)
+        ));
+        assert!(path_is_within_scan_selection(
+            worktree,
+            path("exact.rs"),
+            Some(&selected)
+        ));
+        assert!(!path_is_within_scan_selection(
+            worktree,
+            path("exact.rs.bak"),
+            Some(&selected)
+        ));
+        assert!(!path_is_within_scan_selection(
+            other_worktree,
+            path("src/deep/module.rs"),
+            Some(&selected)
+        ));
+        assert!(path_is_within_scan_selection(worktree, path("any.rs"), None));
+    }
+
+    #[test]
     fn project_scan_filters_sensitive_and_non_source_paths() {
         assert!(!scan_git_status_allowed(git::status::FileStatus::Untracked));
         assert!(!scan_git_status_allowed(git::status::FileStatus::Ignored));
@@ -1335,16 +1582,25 @@ mod tests {
     #[test]
     fn queue_prioritizes_interaction_ages_background_and_skips_occupied_keys() {
         let now = std::time::Instant::now();
+        let first_scope = gpui::EntityId::from(1);
+        let second_scope = gpui::EntityId::from(2);
         let mut waiters = vec![
-            (1, "scan".into(), 2, now),
-            (2, "visible".into(), 1, now),
-            (3, "deep".into(), 0, now),
+            (1, first_scope, "scan".into(), 2, now),
+            (2, first_scope, "visible".into(), 1, now),
+            (3, first_scope, "deep".into(), 0, now),
+            (4, second_scope, "other-project".into(), 0, now),
         ];
-        assert_eq!(next_waiter(&waiters, &[]).unwrap().0, 3);
-        assert_eq!(next_waiter(&waiters, &["deep".into()]).unwrap().0, 2);
-        waiters[0].3 = now - std::time::Duration::from_secs(6);
-        assert_eq!(next_waiter(&waiters, &[]).unwrap().0, 1);
-        assert!(next_waiter(&[], &[]).is_none());
+        assert_eq!(next_waiter(&waiters, first_scope, &[]).unwrap().0, 3);
+        assert_eq!(
+            next_waiter(&waiters, first_scope, &["deep".into()])
+                .unwrap()
+                .0,
+            2
+        );
+        assert_eq!(next_waiter(&waiters, second_scope, &[]).unwrap().0, 4);
+        waiters[0].4 = now - std::time::Duration::from_secs(6);
+        assert_eq!(next_waiter(&waiters, first_scope, &[]).unwrap().0, 1);
+        assert!(next_waiter(&[], first_scope, &[]).is_none());
     }
 
     #[test]
@@ -1637,7 +1893,7 @@ pub fn deep_explain_selection(
         );
 
         let request_key = format!("deep:{}", content_hash(&code));
-        let waiting = RequestWaiter::new(request_key.clone(), 0)?;
+        let waiting = RequestWaiter::new(project.entity_id(), request_key.clone(), 0)?;
         let permit = loop {
             if cancelled.load(Ordering::SeqCst) {
                 markdown.update(cx, |markdown, cx| markdown.replace("讲解已停止", cx));
@@ -2270,8 +2526,22 @@ fn scan_git_status_allowed(status: git::status::FileStatus) -> bool {
     )
 }
 
+fn path_is_within_scan_selection(
+    worktree_id: project::WorktreeId,
+    path: &util::rel_path::RelPath,
+    selected_paths: Option<&[project::ProjectPath]>,
+) -> bool {
+    selected_paths.is_none_or(|paths| {
+        paths.iter().any(|selected| {
+            selected.worktree_id == worktree_id
+                && (path == selected.path.as_ref() || path.starts_with(&selected.path))
+        })
+    })
+}
+
 fn collect_project_scan_candidates(
     project: &gpui::Entity<project::Project>,
+    selected_paths: Option<&[project::ProjectPath]>,
     cx: &mut App,
 ) -> Vec<ProjectScanCandidate> {
     let git_store = project.read(cx).git_store().clone();
@@ -2291,7 +2561,8 @@ fn collect_project_scan_candidates(
         let worktree_id = snapshot.id();
         let root_name = snapshot.root_name().as_unix_str();
         for entry in snapshot.files(false, 0) {
-            if entry.is_ignored
+            if !path_is_within_scan_selection(worktree_id, &entry.path, selected_paths)
+                || entry.is_ignored
                 || entry.is_private
                 || entry.is_external
                 || entry.is_fifo
@@ -2410,20 +2681,26 @@ impl gpui::Render for ProjectScanModal {
 fn show_project_scan_confirmation(
     project: gpui::Entity<project::Project>,
     workspace: gpui::WeakEntity<workspace::Workspace>,
+    selected_paths: Option<Vec<project::ProjectPath>>,
     window: &mut gpui::Window,
     cx: &mut App,
 ) {
-    let settings = CodeExplanationSettings::get_global(cx);
+    let settings = CodeExplanationSettings::get_global(cx).clone();
     let model_label = format!(
         "{} / {}",
         settings.provider.as_deref().unwrap_or("未选择渠道"),
         settings.model.as_deref().unwrap_or("未选择模型")
     )
     .into();
-    let error = (resolve_model(settings, cx).is_err() || !settings.cache_persist)
-        .then(|| SharedString::from("请先选择可用的代码讲解渠道和模型，并开启持久缓存。"));
+    let scan_running = project_scan_state(&project, cx).read(cx).running;
+    let error = if scan_running {
+        Some(SharedString::from("当前项目已有完整扫描正在运行，请等待完成或先停止扫描。"))
+    } else {
+        (resolve_model(&settings, cx).is_err() || !settings.cache_persist)
+            .then(|| SharedString::from("请先选择可用的代码讲解渠道和模型，并开启持久缓存。"))
+    };
     let candidates = if error.is_none() {
-        collect_project_scan_candidates(&project, cx)
+        collect_project_scan_candidates(&project, selected_paths.as_deref(), cx)
     } else {
         Vec::new()
     };
@@ -2443,17 +2720,37 @@ fn show_project_scan_confirmation(
         .log_err();
 }
 
+pub fn show_selected_project_scan_confirmation(
+    project: gpui::Entity<project::Project>,
+    workspace: gpui::WeakEntity<workspace::Workspace>,
+    selected_paths: Vec<project::ProjectPath>,
+    window: &mut gpui::Window,
+    cx: &mut App,
+) {
+    if selected_paths.is_empty() {
+        return;
+    }
+    show_project_scan_confirmation(project, workspace, Some(selected_paths), window, cx);
+}
+
 fn start_project_scan(
     project: gpui::Entity<project::Project>,
     workspace: gpui::WeakEntity<workspace::Workspace>,
     candidates: Vec<ProjectScanCandidate>,
     cx: &mut gpui::AsyncApp,
 ) -> Result<()> {
-    let state = cx.update(|cx| project_scan_state(cx));
+    let state = cx.update(|cx| project_scan_state(&project, cx));
     let cancelled = Arc::new(AtomicBool::new(false));
+    let project_label = candidates
+        .first()
+        .and_then(|candidate| candidate.display_path.split('/').next())
+        .filter(|label| !label.is_empty())
+        .unwrap_or("项目")
+        .to_owned();
     state.update(cx, |state, cx| {
         *state = ProjectScanState {
             running: true,
+            project_label: project_label.into(),
             cancelled: cancelled.clone(),
             total_files: candidates.len(),
             ..Default::default()
@@ -2465,6 +2762,10 @@ fn start_project_scan(
         let scan = run_project_scan(&project, &state, candidates, cancelled.clone(), cx);
         let cancellation = async {
             while !cancelled.load(Ordering::SeqCst) {
+                if workspace.upgrade().is_none() {
+                    cancelled.store(true, Ordering::SeqCst);
+                    break;
+                }
                 executor.timer(std::time::Duration::from_millis(100)).await;
             }
         };
@@ -2727,6 +3028,12 @@ async fn scan_project_file(
                 .await?
                 .is_some()
             {
+                let path = cache_path.clone();
+                let file_path = candidate.path.path.as_unix_str().to_owned();
+                let marker_key = key.clone();
+                cx.background_spawn(async move { cache_mark_file(&path, &file_path, &marker_key) })
+                    .await?;
+                cx.update(|cx| mark_explained_file(&project, candidate.path.clone(), cx));
                 result.cached_units += 1;
                 continue;
             }
@@ -2763,7 +3070,7 @@ async fn scan_project_file(
             break;
         }
         let request_key = format!("{cache_namespace}:{key}");
-        let waiting = RequestWaiter::new(request_key.clone(), 2)?;
+        let waiting = RequestWaiter::new(project.entity_id(), request_key.clone(), 2)?;
         let permit = loop {
             if cancelled.load(Ordering::SeqCst) {
                 result.skipped = true;
@@ -2780,12 +3087,18 @@ async fn scan_project_file(
         let epoch = CACHE_EPOCH.load(Ordering::SeqCst);
         if settings.cache_persist {
             let path = cache_path.clone();
-            let key = key.clone();
+            let cache_key = key.clone();
             if cx
-                .background_spawn(async move { cache_access(&path, &key, None, 0) })
+                .background_spawn(async move { cache_access(&path, &cache_key, None, 0) })
                 .await?
                 .is_some()
             {
+                let path = cache_path.clone();
+                let file_path = candidate.path.path.as_unix_str().to_owned();
+                let marker_key = key.clone();
+                cx.background_spawn(async move { cache_mark_file(&path, &file_path, &marker_key) })
+                    .await?;
+                cx.update(|cx| mark_explained_file(&project, candidate.path.clone(), cx));
                 result.cached_units += 1;
                 drop(permit);
                 continue;
@@ -2824,13 +3137,22 @@ async fn scan_project_file(
                     let budget = settings.cache_max_bytes;
                     let text = text.to_string();
                     let cancelled = cancelled.clone();
+                    let cache_key = key.clone();
                     cx.background_spawn(async move {
-                        cache_access_guarded(&path, &key, Some(&text), budget, || {
+                        cache_access_guarded(&path, &cache_key, Some(&text), budget, || {
                             !cancelled.load(Ordering::SeqCst)
                                 && CACHE_EPOCH.load(Ordering::SeqCst) == epoch
                         })
                     })
                     .await?;
+                    let path = cache_path.clone();
+                    let file_path = candidate.path.path.as_unix_str().to_owned();
+                    let marker_key = key.clone();
+                    cx.background_spawn(
+                        async move { cache_mark_file(&path, &file_path, &marker_key) },
+                    )
+                    .await?;
+                    cx.update(|cx| mark_explained_file(&project, candidate.path.clone(), cx));
                 }
             }
             Ok(_) => {
@@ -2853,260 +3175,336 @@ async fn scan_project_file(
 pub struct CodeExplanationIndicator {
     active: Option<gpui::Entity<Editor>>,
     subscription: Option<gpui::Subscription>,
-    scan_subscription: Option<gpui::Subscription>,
+    scan_subscriptions: HashMap<gpui::EntityId, gpui::Subscription>,
 }
 
 impl gpui::Render for CodeExplanationIndicator {
     fn render(&mut self, _: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = CodeExplanationSettings::get_global(cx).clone();
-        let scan_state = project_scan_state(cx);
-        if self.scan_subscription.is_none() {
-            self.scan_subscription = Some(cx.observe(&scan_state, |_, _, cx| cx.notify()));
-        }
-        let scan = scan_state.read(cx);
-        let scan_cancelled = scan.cancelled.clone();
         let active = self.active.clone();
+        let active_project = active
+            .as_ref()
+            .and_then(|editor| editor.read(cx).project().cloned());
+        let active_project_id = active_project.as_ref().map(gpui::Entity::entity_id);
+        let registry = project_scan_registry(cx);
+        let scan_states = registry.read(cx).scans.clone();
+        self.scan_subscriptions
+            .retain(|project_id, _| scan_states.contains_key(project_id));
+        for (project_id, state) in &scan_states {
+            if !self.scan_subscriptions.contains_key(project_id) {
+                self.scan_subscriptions
+                    .insert(*project_id, cx.observe(state, |_, _, cx| cx.notify()));
+            }
+        }
+        let active_scan_state = active_project
+            .as_ref()
+            .map(|project| project_scan_state(project, cx));
+        let active_scan = active_scan_state.as_ref().map(|state| state.read(cx));
+        let scan_cancelled = active_scan.as_ref().map(|scan| scan.cancelled.clone());
         let busy = active
             .as_ref()
             .is_some_and(|editor| editor.read(cx).explanations.busy);
-        let active_requests = ACTIVE_REQUEST_COUNT.load(std::sync::atomic::Ordering::SeqCst);
-        let scan_running = scan.running;
-        let scan_progress = (scan.completed_files, scan.total_files);
-        let scan_diagnostics = scan.diagnostics.join("\n");
-        ui::PopoverMenu::new("code-explanations-menu")
-            .trigger(
-                IconButton::new("code-explanations", IconName::Book)
-                    .icon_color(if busy || active_requests > 0 {
-                        Color::Accent
-                    } else if settings.enabled {
-                        Color::Success
-                    } else {
-                        Color::Muted
-                    })
-                    .tooltip(ui::Tooltip::text(
-                        if let Some(error) = active
-                            .as_ref()
-                            .and_then(|editor| editor.read(cx).explanations.last_error.clone())
-                        {
-                            error.to_string()
-                        } else if active
-                            .as_ref()
-                            .is_some_and(|editor| editor.read(cx).explanations.dirty)
-                        {
-                            "代码已修改，当前讲解待更新；保存或离开编辑器后刷新".into()
-                        } else if active_requests > 0 {
-                            format!("代码讲解：正在执行 {active_requests} 个请求")
-                        } else if scan_running {
-                            format!(
-                                "项目扫描：已处理 {} / {} 个文件",
-                                scan_progress.0, scan_progress.1
-                            )
-                        } else if busy {
-                            "代码讲解：等待请求".into()
-                        } else if settings.enabled {
-                            "代码讲解：已开启".into()
-                        } else {
-                            "代码讲解：已关闭".into()
-                        },
-                    ))
-                    .when(active_requests > 0, |button| {
-                        button.indicator(Indicator::custom(
-                            h_flex()
-                                .gap_px()
-                                .child(
-                                    SpinnerLabel::dots_variant()
-                                        .size(LabelSize::Custom(rems_from_px(8_f32))),
-                                )
-                                .child(
-                                    Label::new(active_requests.to_string())
-                                        .size(LabelSize::Custom(rems_from_px(8_f32)))
-                                        .color(Color::Accent),
-                                ),
-                        ))
-                    }),
+        let active_requests = active_project_id
+            .map(active_request_count)
+            .unwrap_or_default();
+        let scan_running = active_scan.as_ref().is_some_and(|scan| scan.running);
+        let scan_progress = active_scan
+            .as_ref()
+            .map(|scan| (scan.completed_files, scan.total_files))
+            .unwrap_or_default();
+        let scan_diagnostics = active_scan
+            .as_ref()
+            .map(|scan| scan.diagnostics.join("\n"))
+            .unwrap_or_default();
+        let background_scans = scan_states
+            .iter()
+            .filter(|(project_id, state)| {
+                Some(**project_id) != active_project_id && state.read(cx).running
+            })
+            .map(|(_, state)| {
+                let scan = state.read(cx);
+                format!(
+                    "{}：{} / {} 个文件",
+                    scan.project_label, scan.completed_files, scan.total_files
+                )
+            })
+            .collect::<Vec<_>>();
+        let background_scan_tooltip = (!background_scans.is_empty()).then(|| {
+            format!(
+                "其他项目的讲解扫描正在运行：{}",
+                background_scans.join("；")
             )
-            .menu(move |window, cx| {
-                Some(ui::ContextMenu::build(window, cx, |menu, _, cx| {
-                    let active_project = active.as_ref().and_then(|editor| {
-                        let editor = editor.read(cx);
-                        Some((editor.project()?.clone(), editor.workspace()?.downgrade()))
-                    });
-                    let mut menu = menu
-                        .when_some(active.clone(), |menu, editor| {
-                            let state = &editor.read(cx).explanations;
-                            let message = if let Some(error) = &state.last_error {
-                                error.to_string()
-                            } else if state.dirty {
-                                "代码已修改，当前讲解待更新".into()
+        });
+        h_flex()
+            .gap_1()
+            .child(
+                ui::PopoverMenu::new("code-explanations-menu")
+                    .trigger(
+                        IconButton::new("code-explanations", IconName::Book)
+                            .icon_color(if busy || active_requests > 0 || scan_running {
+                                Color::Accent
+                            } else if settings.enabled {
+                                Color::Success
                             } else {
-                                format!(
-                                    "当前批次：{} / {} 个单元",
-                                    state.progress.0, state.progress.1
-                                )
-                            };
-                            menu.entry(message, None, |_, _| {})
-                        })
-                        .entry(
-                            if settings.enabled {
-                                "关闭代码讲解"
-                            } else {
-                                "开启讲解（向所选服务发送代码）"
-                            },
-                            None,
-                            move |_, cx| {
-                                let enabled = !CodeExplanationSettings::get_global(cx).enabled;
-                                let fs = workspace::AppState::global(cx).fs.clone();
-                                settings::update_settings_file(fs, cx, move |content, _| {
-                                    content.code_explanations.get_or_insert_default().enabled =
-                                        Some(enabled);
-                                });
-                            },
-                        )
-                        .when(scan_running, |menu| {
-                            let cancelled = scan_cancelled.clone();
-                            menu.entry("停止扫描当前项目", None, move |_, _| {
-                                cancelled.store(true, Ordering::SeqCst);
+                                Color::Muted
                             })
-                        })
-                        .when(!scan_running && active_project.is_some(), |menu| {
-                            let project = active_project.clone();
-                            menu.entry(
-                                "扫描当前项目并预生成讲解",
-                                None,
-                                move |window, cx| {
-                                    let Some((project, workspace)) = project.clone() else {
-                                        return;
-                                    };
-                                    show_project_scan_confirmation(project, workspace, window, cx);
+                            .tooltip(ui::Tooltip::text(
+                                if let Some(error) = active.as_ref().and_then(|editor| {
+                                    editor.read(cx).explanations.last_error.clone()
+                                }) {
+                                    error.to_string()
+                                } else if active
+                                    .as_ref()
+                                    .is_some_and(|editor| editor.read(cx).explanations.dirty)
+                                {
+                                    "代码已修改，当前讲解待更新；保存或离开编辑器后刷新".into()
+                                } else if active_requests > 0 {
+                                    format!("当前项目代码讲解：正在执行 {active_requests} 个请求")
+                                } else if scan_running {
+                                    format!(
+                                        "当前项目扫描：已处理 {} / {} 个文件",
+                                        scan_progress.0, scan_progress.1
+                                    )
+                                } else if busy {
+                                    "代码讲解：等待请求".into()
+                                } else if settings.enabled {
+                                    "代码讲解：已开启".into()
+                                } else {
+                                    "代码讲解：已关闭".into()
                                 },
-                            )
-                        })
-                        .separator();
-                    menu = menu.when(!scan_diagnostics.is_empty(), |menu| {
-                        let diagnostics = scan_diagnostics.clone();
-                        menu.entry(
-                            "复制项目扫描失败详情（最多 100 条）",
-                            None,
-                            move |_, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                    diagnostics.clone(),
-                                ));
-                            },
-                        )
-                    });
-                    let failed_editor = active.clone();
-                    menu = menu.entry("重试失败的讲解", None, move |_, cx| {
-                        if let Some(editor) = &failed_editor {
-                            editor.update(cx, |editor, cx| {
-                                if editor.explanations.busy {
-                                    return;
-                                }
-                                editor.explanations.failed.clear();
-                                editor.explanations.last_error = None;
-                                request_refresh(editor);
-                                editor.explanations.last_view = None;
-                                cx.notify();
+                            ))
+                            .when(active_requests > 0, |button| {
+                                button.indicator(ui::Indicator::custom(
+                                    h_flex()
+                                        .gap_px()
+                                        .child(
+                                            SpinnerLabel::dots_variant()
+                                                .size(LabelSize::Custom(rems_from_px(8_f32))),
+                                        )
+                                        .child(
+                                            Label::new(active_requests.to_string())
+                                                .size(LabelSize::Custom(rems_from_px(8_f32)))
+                                                .color(Color::Accent),
+                                        ),
+                                ))
+                            }),
+                    )
+                    .menu(move |window, cx| {
+                        Some(ui::ContextMenu::build(window, cx, |menu, _, cx| {
+                            let active_project = active.as_ref().and_then(|editor| {
+                                let editor = editor.read(cx);
+                                Some((editor.project()?.clone(), editor.workspace()?.downgrade()))
                             });
-                        }
-                    });
-                    let stop_editor = active.clone();
-                    menu = menu.entry("停止当前讲解", None, move |_, cx| {
-                        if let Some(editor) = &stop_editor {
-                            editor.update(cx, |editor, cx| {
-                                editor
-                                    .explanations
-                                    .write_generation
-                                    .fetch_add(1, Ordering::SeqCst);
-                                editor.explanations.generation =
-                                    editor.explanations.generation.wrapping_add(1);
-                                editor.explanations.task = None;
-                                editor
-                                    .explanations
-                                    .deep_cancelled
-                                    .store(true, Ordering::SeqCst);
-                                editor.explanations.deep_task = None;
-                                editor.explanations.busy = false;
-                                editor.explanations.dirty = true;
-                                editor.explanations.refresh_requested = false;
-                                cx.notify();
-                            });
-                        }
-                    });
-                    let retry_editor = active.clone();
-                    menu = menu.entry("重新讲解当前文件", None, move |_, cx| {
-                        if let Some(editor) = &retry_editor {
-                            editor.update(cx, |editor, cx| {
-                                editor.explanations.memory.clear();
-                                editor.explanations.bypass_cache = true;
-                                clear(editor, cx);
-                                cx.notify();
-                            });
-                        }
-                    });
-                    for provider in LanguageModelRegistry::read_global(cx)
-                        .visible_providers()
-                        .into_iter()
-                        .filter(|provider| provider.is_authenticated(cx))
-                    {
-                        let models = provider.provided_models(cx);
-                        menu = menu.submenu(provider.name().0.clone(), move |mut menu, _, _| {
-                            for model in &models {
-                                let provider_id = provider.id().0.to_string();
-                                let model_id = model.id().0.to_string();
-                                menu = menu.entry(
-                                    format!("{} / {}", provider_id, model.name().0),
+                            let mut menu = menu
+                                .when_some(active.clone(), |menu, editor| {
+                                    let state = &editor.read(cx).explanations;
+                                    let message = if let Some(error) = &state.last_error {
+                                        error.to_string()
+                                    } else if state.dirty {
+                                        "代码已修改，当前讲解待更新".into()
+                                    } else {
+                                        format!(
+                                            "当前批次：{} / {} 个单元",
+                                            state.progress.0, state.progress.1
+                                        )
+                                    };
+                                    menu.entry(message, None, |_, _| {})
+                                })
+                                .entry(
+                                    if settings.enabled {
+                                        "关闭代码讲解"
+                                    } else {
+                                        "开启讲解（向所选服务发送代码）"
+                                    },
                                     None,
                                     move |_, cx| {
+                                        let enabled =
+                                            !CodeExplanationSettings::get_global(cx).enabled;
                                         let fs = workspace::AppState::global(cx).fs.clone();
-                                        let provider_id = provider_id.clone();
-                                        let model_id = model_id.clone();
                                         settings::update_settings_file(
                                             fs,
                                             cx,
                                             move |content, _| {
-                                                let settings = content
+                                                content
                                                     .code_explanations
-                                                    .get_or_insert_default();
-                                                settings.provider = Some(provider_id.into());
-                                                settings.model = Some(model_id.into());
+                                                    .get_or_insert_default()
+                                                    .enabled = Some(enabled);
                                             },
                                         );
                                     },
+                                )
+                                .when_some(
+                                    scan_running.then_some(scan_cancelled.clone()).flatten(),
+                                    |menu, cancelled| {
+                                        menu.entry("停止扫描当前项目", None, move |_, _| {
+                                            cancelled.store(true, Ordering::SeqCst);
+                                        })
+                                    },
+                                )
+                                .when(!scan_running && active_project.is_some(), |menu| {
+                                    let project = active_project.clone();
+                                    menu.entry(
+                                        "扫描当前项目并预生成讲解",
+                                        None,
+                                        move |window, cx| {
+                                            let Some((project, workspace)) = project.clone() else {
+                                                return;
+                                            };
+                                            show_project_scan_confirmation(
+                                                project, workspace, None, window, cx,
+                                            );
+                                        },
+                                    )
+                                })
+                                .separator();
+                            menu = menu.when(!scan_diagnostics.is_empty(), |menu| {
+                                let diagnostics = scan_diagnostics.clone();
+                                menu.entry(
+                                    "复制项目扫描失败详情（最多 100 条）",
+                                    None,
+                                    move |_, cx| {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            diagnostics.clone(),
+                                        ));
+                                    },
+                                )
+                            });
+                            let failed_editor = active.clone();
+                            menu = menu.entry("重试失败的讲解", None, move |_, cx| {
+                                if let Some(editor) = &failed_editor {
+                                    editor.update(cx, |editor, cx| {
+                                        if editor.explanations.busy {
+                                            return;
+                                        }
+                                        editor.explanations.failed.clear();
+                                        editor.explanations.last_error = None;
+                                        request_refresh(editor);
+                                        editor.explanations.last_view = None;
+                                        cx.notify();
+                                    });
+                                }
+                            });
+                            let stop_editor = active.clone();
+                            menu = menu.entry("停止当前讲解", None, move |_, cx| {
+                                if let Some(editor) = &stop_editor {
+                                    editor.update(cx, |editor, cx| {
+                                        editor
+                                            .explanations
+                                            .write_generation
+                                            .fetch_add(1, Ordering::SeqCst);
+                                        editor.explanations.generation =
+                                            editor.explanations.generation.wrapping_add(1);
+                                        editor.explanations.task = None;
+                                        editor
+                                            .explanations
+                                            .deep_cancelled
+                                            .store(true, Ordering::SeqCst);
+                                        editor.explanations.deep_task = None;
+                                        editor.explanations.busy = false;
+                                        editor.explanations.dirty = true;
+                                        editor.explanations.refresh_requested = false;
+                                        cx.notify();
+                                    });
+                                }
+                            });
+                            let retry_editor = active.clone();
+                            menu = menu.entry("重新讲解当前文件", None, move |_, cx| {
+                                if let Some(editor) = &retry_editor {
+                                    editor.update(cx, |editor, cx| {
+                                        editor.explanations.memory.clear();
+                                        editor.explanations.bypass_cache = true;
+                                        clear(editor, cx);
+                                        cx.notify();
+                                    });
+                                }
+                            });
+                            for provider in LanguageModelRegistry::read_global(cx)
+                                .visible_providers()
+                                .into_iter()
+                                .filter(|provider| provider.is_authenticated(cx))
+                            {
+                                let models = provider.provided_models(cx);
+                                menu = menu.submenu(
+                                    provider.name().0.clone(),
+                                    move |mut menu, _, _| {
+                                        for model in &models {
+                                            let provider_id = provider.id().0.to_string();
+                                            let model_id = model.id().0.to_string();
+                                            menu = menu.entry(
+                                                format!("{} / {}", provider_id, model.name().0),
+                                                None,
+                                                move |_, cx| {
+                                                    let fs =
+                                                        workspace::AppState::global(cx).fs.clone();
+                                                    let provider_id = provider_id.clone();
+                                                    let model_id = model_id.clone();
+                                                    settings::update_settings_file(
+                                                        fs,
+                                                        cx,
+                                                        move |content, _| {
+                                                            let settings = content
+                                                                .code_explanations
+                                                                .get_or_insert_default();
+                                                            settings.provider =
+                                                                Some(provider_id.into());
+                                                            settings.model = Some(model_id.into());
+                                                        },
+                                                    );
+                                                },
+                                            );
+                                        }
+                                        menu
+                                    },
                                 );
                             }
-                            menu
-                        });
-                    }
-                    menu.separator()
-                        .entry("清除全部讲解缓存", None, |_, cx| {
-                            cx.background_spawn(async move {
-                                let _guard = CACHE_LOCK
-                                    .lock()
-                                    .map_err(|_| anyhow::anyhow!("讲解缓存锁不可用"))?;
-                                CACHE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                SHARED_RESULTS
-                                    .lock()
-                                    .map_err(|_| anyhow::anyhow!("讲解共享缓存锁不可用"))?
-                                    .clear();
-                                let directory = paths::data_dir().join("code-explanations");
-                                if directory.exists() {
-                                    trim_global_cache(&directory, std::path::Path::new(""), 0)?;
-                                }
-                                anyhow::Ok(())
-                            })
-                            .detach_and_log_err(cx);
-                        })
-                        .entry("打开代码讲解设置", None, |window, cx| {
-                            window.dispatch_action(
-                                zed_actions::OpenSettingsAt {
-                                    path: "code_explanations".into(),
-                                    target: None,
-                                }
-                                .boxed_clone(),
-                                cx,
-                            );
-                        })
-                }))
+                            menu.separator()
+                                .entry("清除全部讲解缓存", None, |_, cx| {
+                                    code_explanation_file_index(cx).update(cx, |index, cx| {
+                                        index.files.clear();
+                                        cx.notify();
+                                    });
+                                    cx.background_spawn(async move {
+                                        let _guard = CACHE_LOCK
+                                            .lock()
+                                            .map_err(|_| anyhow::anyhow!("讲解缓存锁不可用"))?;
+                                        CACHE_EPOCH
+                                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                        SHARED_RESULTS
+                                            .lock()
+                                            .map_err(|_| anyhow::anyhow!("讲解共享缓存锁不可用"))?
+                                            .clear();
+                                        let directory = paths::data_dir().join("code-explanations");
+                                        if directory.exists() {
+                                            trim_global_cache(
+                                                &directory,
+                                                std::path::Path::new(""),
+                                                0,
+                                            )?;
+                                        }
+                                        anyhow::Ok(())
+                                    })
+                                    .detach_and_log_err(cx);
+                                })
+                                .entry("打开代码讲解设置", None, |window, cx| {
+                                    window.dispatch_action(
+                                        zed_actions::OpenSettingsAt {
+                                            path: "code_explanations".into(),
+                                            target: None,
+                                        }
+                                        .boxed_clone(),
+                                        cx,
+                                    );
+                                })
+                        }))
+                    }),
+            )
+            .when_some(background_scan_tooltip, |this, tooltip| {
+                this.child(
+                    IconButton::new("background-code-explanation-scans", IconName::HistoryRerun)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(ui::Tooltip::text(tooltip)),
+                )
             })
     }
 }

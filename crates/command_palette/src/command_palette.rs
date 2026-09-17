@@ -500,7 +500,7 @@ impl PickerDelegate for CommandPaletteDelegate {
                 let candidates = commands
                     .iter()
                     .enumerate()
-                    .map(|(ix, command)| StringMatchCandidate::new(ix, &command.name))
+                    .map(|(ix, command)| StringMatchCandidate::new_with_pinyin(ix, &command.name))
                     .collect::<Vec<_>>();
 
                 let mut matches = fuzzy_nucleo::match_strings_async(

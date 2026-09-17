@@ -443,6 +443,8 @@ actions!(
         Redo,
         /// Opens a markdown preview for the selected file.
         OpenMarkdownPreview,
+        /// Generates complete AI explanations for the selected files and directories.
+        ScanSelectedEntriesForCodeExplanations,
     ]
 );
 
@@ -840,6 +842,9 @@ impl ProjectPanel {
                 cx.notify();
             })
             .detach();
+            let explanation_index = editor::code_explanations::code_explanation_file_index(cx);
+            cx.observe(&explanation_index, |_, _, cx| cx.notify())
+                .detach();
 
             let mut project_panel_settings = *ProjectPanelSettings::get_global(cx);
             cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
@@ -872,6 +877,16 @@ impl ProjectPanel {
 
             let scroll_handle = UniformListScrollHandle::new();
             let weak_project_panel = cx.weak_entity();
+            cx.spawn({
+                let project = project.clone();
+                async move |_, cx| {
+                    editor::code_explanations::load_code_explanation_file_index(project, cx)
+                        .await
+                        .log_err();
+                }
+            })
+            .detach();
+
             let mut this = Self {
                 project: project.clone(),
                 hover_scroll_task: None,
@@ -1154,11 +1169,21 @@ impl ProjectPanel {
             };
 
             let has_pasteable_content = self.has_pasteable_content(cx);
+            let can_scan_selection = self.selected_code_explanation_paths(cx).is_some_and(|paths| {
+                !paths.is_empty()
+                    && !project::DisableAiSettings::get_global(cx).disable_ai
+            });
             let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
                 menu.context(self.focus_handle.clone()).map(|menu| {
                     if is_read_only {
                         menu.when(is_markdown, |menu| {
                             menu.action("打开Markdown预览", Box::new(OpenMarkdownPreview))
+                        })
+                        .when(can_scan_selection, |menu| {
+                            menu.separator().action(
+                                "完整扫描讲解所选文件",
+                                Box::new(ScanSelectedEntriesForCodeExplanations),
+                            )
                         })
                         .when(is_dir, |menu| {
                             menu.action("搜索内部", Box::new(NewSearchInDirectory))
@@ -1179,6 +1204,12 @@ impl ProjectPanel {
                             .action("在终端中打开", Box::new(OpenInTerminal))
                             .when(is_markdown, |menu| {
                                 menu.action("打开Markdown预览", Box::new(OpenMarkdownPreview))
+                            })
+                            .when(can_scan_selection, |menu| {
+                                menu.separator().action(
+                                    "完整扫描讲解所选文件",
+                                    Box::new(ScanSelectedEntriesForCodeExplanations),
+                                )
                             })
                             .when(is_dir, |menu| {
                                 menu.separator()
@@ -4055,6 +4086,43 @@ impl ProjectPanel {
         self.index_for_entry(selection.entry_id, selection.worktree_id)
     }
 
+    fn selected_code_explanation_paths(&self, cx: &App) -> Option<Vec<ProjectPath>> {
+        let project = self.project.read(cx);
+        let entries = self.disjoint_entries(self.effective_entries(), cx);
+        let mut paths = Vec::with_capacity(entries.len());
+        for selected in entries {
+            let worktree = project.worktree_for_id(selected.worktree_id, cx)?;
+            let worktree = worktree.read(cx);
+            let entry = worktree.entry_for_id(selected.entry_id)?;
+            if entry.is_private || entry.is_ignored || entry.is_external || entry.is_fifo {
+                continue;
+            }
+            paths.push(ProjectPath {
+                worktree_id: selected.worktree_id,
+                path: entry.path.clone(),
+            });
+        }
+        Some(paths)
+    }
+
+    fn scan_selected_entries_for_code_explanations(
+        &mut self,
+        _: &ScanSelectedEntriesForCodeExplanations,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(paths) = self.selected_code_explanation_paths(cx) else {
+            return;
+        };
+        editor::code_explanations::show_selected_project_scan_confirmation(
+            self.project.clone(),
+            self.workspace.clone(),
+            paths,
+            window,
+            cx,
+        );
+    }
+
     fn disjoint_effective_entries_excluding_roots(&self, cx: &App) -> BTreeSet<SelectedEntry> {
         let project = self.project.read(cx);
         let entries = self
@@ -5837,7 +5905,7 @@ impl ProjectPanel {
         let kind = details.kind;
         let is_sticky = details.sticky.is_some();
         let sticky_index = details.sticky.as_ref().map(|this| this.sticky_index);
-        let settings = ProjectPanelSettings::get_global(cx);
+        let settings = *ProjectPanelSettings::get_global(cx);
         let show_editor = details.is_editing && !details.is_processing;
 
         let selection = SelectedEntry {
@@ -5953,6 +6021,15 @@ impl ProjectPanel {
             .git_status_indicator
             .then(|| git_status_indicator(details.git_status))
             .flatten();
+        let explanation_index = editor::code_explanations::code_explanation_file_index(cx);
+        let has_ai_explanation = kind.is_file()
+            && explanation_index.read(cx).contains(
+                &self.project,
+                &ProjectPath {
+                    worktree_id,
+                    path: path.clone(),
+                },
+            );
 
         let id: ElementId = if is_sticky {
             SharedString::from(format!("project_panel_sticky_item_{}", entry_id.to_usize())).into()
@@ -6352,7 +6429,8 @@ impl ProjectPanel {
                     .when(
                         canonical_path.is_some()
                             || diagnostic_count.is_some()
-                            || git_indicator.is_some(),
+                            || git_indicator.is_some()
+                            || has_ai_explanation,
                         |this| {
                             let symlink_element = canonical_path.map(|path| {
                                 div()
@@ -6393,6 +6471,13 @@ impl ProjectPanel {
                                                         .color(Color::Warning),
                                                 )
                                             },
+                                        )
+                                    })
+                                    .when(has_ai_explanation, |this| {
+                                        this.child(
+                                            Label::new("AI")
+                                                .size(LabelSize::Custom(rems_from_px(8_f32)))
+                                                .color(Color::Muted),
                                         )
                                     })
                                     .when_some(git_indicator, |this, (label, color)| {
@@ -7364,6 +7449,7 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::fold_directory))
                 .on_action(cx.listener(Self::remove_from_project))
                 .on_action(cx.listener(Self::compare_marked_files))
+                .on_action(cx.listener(Self::scan_selected_entries_for_code_explanations))
                 .when(!project.is_read_only(cx), |el| {
                     el.on_action(cx.listener(Self::new_file))
                         .on_action(cx.listener(Self::new_directory))
