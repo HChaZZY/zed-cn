@@ -11,6 +11,7 @@ workspace = true
 [lib]
 path = "src/activity_indicator.rs"
 doctest = false
+test = false
 
 [features]
 test-support = []
@@ -24,7 +25,9 @@ fs.workspace = true
 futures.workspace = true
 gpui.workspace = true
 language.workspace = true
+notifications.workspace = true
 project.workspace = true
+remote.workspace = true
 proto.workspace = true
 smallvec.workspace = true
 ui.workspace = true
