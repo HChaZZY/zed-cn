@@ -140,7 +140,7 @@ pub struct ConfirmCodeAction {
 }
 
 /// Toggles comment markers for the selected lines.
-#[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
+#[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
 #[action(namespace = editor)]
 #[serde(deny_unknown_fields)]
 pub struct ToggleComments {
@@ -148,6 +148,22 @@ pub struct ToggleComments {
     pub advance_downwards: bool,
     #[serde(default)]
     pub ignore_indent: bool,
+    /// Whether to add comment markers to blank lines inside a multi-line
+    /// selection. A line of only whitespace counts as blank. Defaults to true.
+    #[serde(default = "default_true")]
+    pub comment_empty_lines: bool,
+}
+
+// `Default` is written out rather than derived because `comment_empty_lines`
+// defaults to true.
+impl Default for ToggleComments {
+    fn default() -> Self {
+        Self {
+            advance_downwards: false,
+            ignore_indent: false,
+            comment_empty_lines: true,
+        }
+    }
 }
 
 /// Toggles block comment markers for the selected text.
@@ -409,6 +425,14 @@ actions!(
 actions!(
     editor,
     [
+        /// 运行选中的代码；没有选区时保存并运行当前文件。
+        RunCode,
+        /// 运行选中的独立代码片段。
+        RunSelection,
+        /// 停止当前工作区中的代码运行器任务。
+        StopCode,
+        /// 保存并运行当前文件，自动选择语言运行工具。
+        RunFile,
         /// Accepts the full edit prediction.
         AcceptEditPrediction,
         /// Accepts a partial edit prediction.
@@ -917,6 +941,13 @@ actions!(
         ToggleSoftWrap,
         /// Toggles the tab bar display.
         ToggleTabBar,
+        /// Generates a syntax-level explanation for the selected code and adds
+        /// a line-end control that opens the explanation in a modal.
+        DeepExplainSelection,
+        /// Translates the selected text, or the word under the cursor when
+        /// nothing is selected, using the model configured under
+        /// `hover_translation` in settings.
+        TranslateSelection,
         /// Transposes characters around cursor.
         Transpose,
         /// Undoes the last edit.
