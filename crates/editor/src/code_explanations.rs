@@ -134,6 +134,7 @@ struct ProjectScanState {
     total_files: usize,
     completed_files: usize,
     cached_units: usize,
+    fully_cached_files: usize,
     requested_units: usize,
     skipped_files: usize,
     failures: usize,
@@ -1147,6 +1148,48 @@ fn cached_file_paths(path: &std::path::Path) -> Result<Vec<String>> {
     .rows::<String>()
 }
 
+fn cache_contains_complete_file(
+    path: &std::path::Path,
+    file_path: &str,
+    keys: &[String],
+) -> Result<bool> {
+    use db::sqlez::{connection::Connection, statement::Statement};
+    if keys.is_empty() || !path.is_file() {
+        return Ok(false);
+    }
+    let _guard = CACHE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("讲解缓存锁不可用"))?;
+    let connection = Connection::open_file(path.to_str().context("缓存路径编码无效")?);
+    if !connection.persistent() {
+        return Ok(false);
+    }
+    let tables = Statement::prepare(
+        &connection,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('explanations', 'explained_files')",
+    )?
+    .rows::<i64>()?
+    .into_iter()
+    .next()
+    .unwrap_or_default();
+    if tables != 2 {
+        return Ok(false);
+    }
+    let mut select = Statement::prepare(
+        &connection,
+        "SELECT EXISTS(SELECT 1 FROM explanations INNER JOIN explained_files ON explanations.key = explained_files.key WHERE explanations.key = ?1 AND explained_files.path = ?2)",
+    )?;
+    for key in keys {
+        select.bind_text(1, key)?;
+        select.bind_text(2, file_path)?;
+        if select.rows::<i64>()?.into_iter().next() != Some(1) {
+            return Ok(false);
+        }
+        select.reset();
+    }
+    Ok(true)
+}
+
 fn cache_mark_file(path: &std::path::Path, file_path: &str, key: &str) -> Result<()> {
     use db::sqlez::{connection::Connection, statement::Statement};
     let _guard = CACHE_LOCK
@@ -1415,16 +1458,27 @@ mod tests {
         let path = directory.path().join("cache.sqlite");
         assert_eq!(cache_access(&path, "missing", None, 0).unwrap(), None);
         cache_access(&path, "a", Some("first"), 100).unwrap();
+        cache_mark_file(&path, "src/main.rs", "a").unwrap();
         assert_eq!(
             cache_access(&path, "a", None, 0).unwrap().as_deref(),
             Some("first")
         );
+        assert!(cache_contains_complete_file(&path, "src/main.rs", &["a".to_owned()]).unwrap());
+        assert!(
+            !cache_contains_complete_file(&path, "src/main.rs", &["a".to_owned(), "b".to_owned()])
+                .unwrap()
+        );
         cache_access(&path, "b", Some("second"), 6).unwrap();
+        cache_mark_file(&path, "src/main.rs", "b").unwrap();
         assert_eq!(
             cache_access(&path, "b", None, 0).unwrap().as_deref(),
             Some("second")
         );
         assert_eq!(cache_access(&path, "a", None, 0).unwrap(), None);
+        assert!(
+            !cache_contains_complete_file(&path, "src/main.rs", &["a".to_owned(), "b".to_owned()])
+                .unwrap()
+        );
     }
 
     #[test]
@@ -2650,7 +2704,7 @@ impl gpui::Render for ProjectScanModal {
                             .child(Label::new(format!("发送到：{}", self.model_label)))
                             .child(Label::new("扫描范围：可见且受信任工作树中的 Git 已跟踪源码。未跟踪和被忽略的文件不会进入清单。").color(Color::Muted))
                             .child(Label::new("还会排除敏感/私密文件、项目外链接、依赖与构建产物、配置与文档，以及超过 512 KiB 的文件。").color(Color::Muted))
-                            .child(Label::new("以下是候选清单，不代表最终请求数；读取后仍会检查语法支持、生成内容和超长行，已有缓存可复用。").color(Color::Muted))
+                            .child(Label::new("以下是候选清单，不代表最终请求数；读取后仍会检查语法支持、生成内容和超长行。内容与当前模型配置均未变化且缓存完整的文件会整文件跳过，只处理新增或变化的代码。").color(Color::Muted))
                             .child(Label::new("只预生成本机讲解缓存，不修改项目文件。实际发送的源码可能产生模型费用；开始后可从书本菜单停止，已发送的请求仍可能计费。").color(Color::Warning))
                             .when(self.candidates.is_empty() && self.error.is_none(), |this| this.child(Label::new("没有符合规则的候选源码。请检查 Git 跟踪状态、工作树信任和文件类型。").color(Color::Warning)))
                             .when_some(self.error.clone(), |this, error| this.child(Label::new(error).color(Color::Warning)))
@@ -2790,10 +2844,11 @@ fn start_project_scan(
             let message = state.read_with(cx, |state, _| {
                 if cancelled.load(Ordering::SeqCst) {
                     format!(
-                        "项目讲解扫描已停止：处理 {} / {} 个文件，生成 {} 个单元，缓存命中 {} 个，失败 {} 个",
+                        "项目讲解扫描已停止：处理 {} / {} 个文件，生成 {} 个单元，完整跳过 {} 个文件，缓存命中 {} 个单元，失败 {} 个",
                         state.completed_files,
                         state.total_files,
                         state.requested_units,
+                        state.fully_cached_files,
                         state.cached_units,
                         state.failures
                     )
@@ -2801,9 +2856,10 @@ fn start_project_scan(
                     format!("项目讲解扫描中断：{error}")
                 } else {
                     format!(
-                        "项目讲解扫描完成：处理 {} 个文件，生成 {} 个单元，缓存命中 {} 个，跳过 {} 个，失败 {} 个",
+                        "项目讲解扫描完成：处理 {} 个文件，生成 {} 个单元，完整跳过 {} 个文件，缓存命中 {} 个单元，规则跳过 {} 个，失败 {} 个",
                         state.completed_files,
                         state.requested_units,
+                        state.fully_cached_files,
                         state.cached_units,
                         state.skipped_files,
                         state.failures
@@ -2829,6 +2885,7 @@ fn start_project_scan(
 #[derive(Default)]
 struct ScannedFileResult {
     cached_units: usize,
+    fully_cached: bool,
     requested_units: usize,
     skipped: bool,
     failed: bool,
@@ -2892,6 +2949,7 @@ fn record_scanned_file(
         match result {
             Ok(result) => {
                 state.cached_units += result.cached_units;
+                state.fully_cached_files += usize::from(result.fully_cached);
                 state.requested_units += result.requested_units;
                 state.skipped_files += usize::from(result.skipped);
                 state.failures += usize::from(result.failed);
@@ -3004,30 +3062,56 @@ async fn scan_project_file(
         |text| model.model.estimate_tokens(text),
     );
     let mut result = ScannedFileResult::default();
-    if units.is_empty() {
+    let prepared_units = units
+        .into_iter()
+        .filter_map(|unit| {
+            let code = snapshot
+                .text_for_range(unit.range.clone())
+                .collect::<String>();
+            if code.is_empty() {
+                return None;
+            }
+            let key = format!(
+                "v6:{provider_configuration}:{:?}:{:?}:{}:{}:{}",
+                settings.provider,
+                settings.model,
+                settings.target_language,
+                settings.detailed,
+                content_hash(&format!("{language}\n{}\n{}", unit.context, code))
+            );
+            Some((unit, code, key))
+        })
+        .collect::<Vec<_>>();
+    if prepared_units.is_empty() {
         result.skipped = true;
         result.error = Some(format!(
             "{}：没有可放入模型请求预算的代码单元",
             candidate.display_path
         ));
+        return Ok(result);
     }
-    for unit in units {
+    if settings.cache_persist {
+        let path = cache_path.clone();
+        let file_path = candidate.path.path.as_unix_str().to_owned();
+        let keys = prepared_units
+            .iter()
+            .map(|(_, _, key)| key.clone())
+            .collect::<Vec<_>>();
+        if cx
+            .background_spawn(async move { cache_contains_complete_file(&path, &file_path, &keys) })
+            .await?
+        {
+            cx.update(|cx| mark_explained_file(&project, candidate.path.clone(), cx));
+            result.cached_units = prepared_units.len();
+            result.fully_cached = true;
+            return Ok(result);
+        }
+    }
+    for (unit, code, key) in prepared_units {
         if cancelled.load(Ordering::SeqCst) {
             result.skipped = true;
             break;
         }
-        let code = snapshot.text_for_range(unit.range).collect::<String>();
-        if code.is_empty() {
-            continue;
-        }
-        let key = format!(
-            "v6:{provider_configuration}:{:?}:{:?}:{}:{}:{}",
-            settings.provider,
-            settings.model,
-            settings.target_language,
-            settings.detailed,
-            content_hash(&format!("{language}\n{}\n{}", unit.context, code))
-        );
         if settings.cache_persist {
             let path = cache_path.clone();
             let key_for_cache = key.clone();
