@@ -5,6 +5,7 @@ pub mod terminal_panel;
 mod terminal_path_like_target;
 pub mod terminal_scrollbar;
 
+use anyhow::Context as _;
 use editor::{
     Editor, EditorSettings, actions::SelectAll, blink_manager::BlinkManager,
     ui_scrollbar_settings_from_raw,
@@ -18,6 +19,7 @@ use gpui::{
 use menu;
 use persistence::TerminalDb;
 use project::{Project, ProjectEntryId, search::SearchQuery};
+use remote::RemoteConnectionOptions;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::{
@@ -30,7 +32,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use task::TaskId;
 use terminal::{
@@ -50,11 +52,12 @@ use ui::{
 };
 use util::ResultExt;
 use workspace::{
-    CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
+    CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane, Toast,
     ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
     item::{
         HighlightedText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
     },
+    notifications::{NotificationId, NotifyTaskExt as _},
     register_serializable_item,
     searchable::{
         Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
@@ -77,6 +80,71 @@ fn viewport_line_for_point(point: Point, display_offset: usize) -> Option<usize>
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+const TEMPORARY_CLIPBOARD_FILE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_TEMPORARY_CLIPBOARD_FILE_BYTES: usize = 100 * 1024 * 1024;
+
+fn create_local_temporary_clipboard_file(
+    suggested_name: &str,
+    bytes: &[u8],
+) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        bytes.len() <= MAX_TEMPORARY_CLIPBOARD_FILE_BYTES,
+        "剪贴板图片超过 100 MiB 限制"
+    );
+    let original_name = suggested_name;
+    let suggested_name = Path::new(original_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && name.len() <= 255)
+        .context("剪贴板文件名无效")?;
+    anyhow::ensure!(suggested_name == original_name, "剪贴板文件名无效");
+    let directory = std::env::temp_dir().join("zed-clipboard-files");
+    std::fs::create_dir_all(&directory)?;
+    cleanup_local_temporary_clipboard_files(&directory);
+
+    let extension = Path::new(suggested_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| format!(".{extension}"))
+        .unwrap_or_default();
+    let stem = Path::new(suggested_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("clipboard-file");
+    let path = directory.join(format!("{stem}-{}{extension}", uuid::Uuid::new_v4()));
+    let staging_path = directory.join(format!(".{}.part", uuid::Uuid::new_v4()));
+    std::fs::write(&staging_path, bytes)?;
+    if let Err(error) = std::fs::rename(&staging_path, &path) {
+        if let Err(cleanup_error) = std::fs::remove_file(&staging_path) {
+            log::warn!("failed to remove clipboard staging file: {cleanup_error:#}");
+        }
+        return Err(error.into());
+    }
+    Ok(path)
+}
+
+fn cleanup_local_temporary_clipboard_files(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let expired = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .is_some_and(|age| age >= TEMPORARY_CLIPBOARD_FILE_RETENTION);
+        if expired && let Err(error) = std::fs::remove_file(entry.path()) {
+            log::warn!("failed to remove expired clipboard file: {error:#}");
+        }
+    }
+}
 
 /// Event to transmit the scroll from the element to the view
 #[derive(Clone, Debug, PartialEq)]
@@ -915,19 +983,30 @@ impl TerminalView {
             return;
         };
 
-        match clipboard.entries().first() {
-            Some(ClipboardEntry::Image(image)) if !image.bytes.is_empty() => {
-                self.forward_ctrl_v(cx);
-            }
-            Some(ClipboardEntry::ExternalPaths(paths)) => {
-                self.add_paths_to_terminal(paths.paths(), window, cx);
-            }
-            _ => {
-                if let Some(text) = clipboard.text() {
-                    self.terminal
-                        .update(cx, |terminal, _cx| terminal.paste(&text));
-                }
-            }
+        if let Some(paths) = clipboard.entries().iter().find_map(|entry| match entry {
+            ClipboardEntry::ExternalPaths(paths) if !paths.paths().is_empty() => Some(paths),
+            _ => None,
+        }) {
+            self.paste_clipboard_paths(paths.paths(), window, cx);
+            return;
+        }
+
+        if let Some(image) = clipboard.entries().iter().find_map(|entry| match entry {
+            ClipboardEntry::Image(image) if !image.bytes.is_empty() => Some(image),
+            _ => None,
+        }) {
+            self.paste_clipboard_file(
+                format!("clipboard-image.{}", image.format.extension()),
+                image.bytes.clone(),
+                window,
+                cx,
+            );
+            return;
+        }
+
+        if let Some(text) = clipboard.text() {
+            self.terminal
+                .update(cx, |terminal, _cx| terminal.paste(&text));
         }
     }
 
@@ -955,12 +1034,158 @@ impl TerminalView {
         }
     }
 
-    /// Emits a raw Ctrl+V so TUI agents can read the OS clipboard directly
-    /// and attach images using their native workflows.
-    fn forward_ctrl_v(&self, cx: &mut Context<Self>) {
-        self.terminal.update(cx, |term, _| {
-            term.input(vec![0x16]);
-        });
+    fn paste_clipboard_paths(
+        &mut self,
+        paths: &[PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.project.upgrade() else {
+            self.add_paths_to_terminal(paths, window, cx);
+            return;
+        };
+        if project.read(cx).is_local() {
+            self.add_paths_to_terminal(paths, window, cx);
+            return;
+        }
+
+        if !self.remote_supports_temporary_files(&project, cx) {
+            self.show_temporary_file_unavailable(&project, cx);
+            return;
+        }
+
+        let fs = project.read(cx).fs().clone();
+        let files = paths.to_vec();
+        let terminal_view = cx.weak_entity();
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let mut remote_paths = Vec::with_capacity(files.len());
+            for path in files {
+                let metadata = fs.metadata(&path).await?;
+                let metadata = metadata.context("无法读取剪贴板文件信息")?;
+                anyhow::ensure!(
+                    !metadata.is_dir && !metadata.is_symlink && !metadata.is_fifo,
+                    "只能将普通文件暂存到远程终端"
+                );
+                anyhow::ensure!(
+                    metadata.len <= MAX_TEMPORARY_CLIPBOARD_FILE_BYTES as u64,
+                    "剪贴板文件超过 100 MiB 限制"
+                );
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("剪贴板文件名无效")?
+                    .to_string();
+                let bytes = fs.load_bytes(&path).await?;
+                let task = project.read_with(cx, |project, cx| {
+                    project.create_temporary_file(name, bytes, cx)
+                });
+                remote_paths.push(task.await?);
+            }
+            terminal_view.update_in(cx, |terminal_view, window, cx| {
+                terminal_view.add_paths_to_terminal(&remote_paths, window, cx);
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_notify_err(workspace, window, cx);
+    }
+
+    fn paste_clipboard_file(
+        &mut self,
+        suggested_name: String,
+        bytes: Vec<u8>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.project.upgrade() else {
+            self.write_local_temporary_file(suggested_name, bytes, window, cx);
+            return;
+        };
+        if project.read(cx).is_local() {
+            self.write_local_temporary_file(suggested_name, bytes, window, cx);
+            return;
+        }
+
+        if !self.remote_supports_temporary_files(&project, cx) {
+            self.show_temporary_file_unavailable(&project, cx);
+            return;
+        }
+
+        let task = project
+            .read(cx)
+            .create_temporary_file(suggested_name, bytes, cx);
+        let terminal_view = cx.weak_entity();
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let path = task.await?;
+            terminal_view.update_in(cx, |terminal_view, window, cx| {
+                terminal_view.add_paths_to_terminal(&[path], window, cx);
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_notify_err(workspace, window, cx);
+    }
+
+    fn write_local_temporary_file(
+        &mut self,
+        suggested_name: String,
+        bytes: Vec<u8>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let terminal_view = cx.weak_entity();
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let path = cx
+                .background_spawn(async move {
+                    create_local_temporary_clipboard_file(&suggested_name, &bytes)
+                })
+                .await?;
+            terminal_view.update_in(cx, |terminal_view, window, cx| {
+                terminal_view.add_paths_to_terminal(&[path], window, cx);
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_notify_err(workspace, window, cx);
+    }
+
+    fn remote_supports_temporary_files(&self, project: &Entity<Project>, cx: &App) -> bool {
+        project.read(cx).supports_temporary_files(cx)
+            && match project.read(cx).remote_connection_options(cx) {
+                Some(RemoteConnectionOptions::Ssh(options)) => {
+                    options.remote_server_source == settings::RemoteServerSource::ZedCn
+                }
+                Some(RemoteConnectionOptions::Wsl(_) | RemoteConnectionOptions::Docker(_)) => true,
+                #[cfg(any(test, feature = "test-support"))]
+                Some(RemoteConnectionOptions::Mock(_)) => true,
+                None => false,
+            }
+    }
+
+    fn show_temporary_file_unavailable(&self, project: &Entity<Project>, cx: &mut Context<Self>) {
+        struct OfficialRemoteClipboardFiles;
+
+        let official = matches!(
+            project.read(cx).remote_connection_options(cx),
+            Some(RemoteConnectionOptions::Ssh(options))
+                if options.remote_server_source == settings::RemoteServerSource::Official
+        );
+        let message = if official {
+            "当前连接使用官方 Zed Remote Server，无法将本机剪贴板中的图片或文件暂存到远程终端。请在“查看服务器选项”中将远程服务来源切换为 Zed CN，然后重新连接。"
+        } else {
+            "当前 Remote Server 不支持剪贴板临时文件。请升级 Zed CN Remote Server 并重新连接后再试。"
+        };
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(
+                        NotificationId::unique::<OfficialRemoteClipboardFiles>(),
+                        message,
+                    ),
+                    cx,
+                );
+            })
+            .ok();
     }
 
     pub fn add_paths_to_terminal(&self, paths: &[PathBuf], window: &mut Window, cx: &mut App) {
@@ -2232,6 +2457,28 @@ mod tests {
         let written =
             String::from_utf8(input_log.remove(0)).expect("terminal write should be valid UTF-8");
         assert_eq!(written, expected_text);
+    }
+
+    #[test]
+    fn local_clipboard_image_is_written_to_a_temporary_file() {
+        let path = create_local_temporary_clipboard_file("clipboard-image.png", b"image-bytes")
+            .expect("temporary clipboard file");
+        assert_eq!(
+            std::fs::read(&path).expect("read temporary file"),
+            b"image-bytes"
+        );
+        assert_eq!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("png")
+        );
+        std::fs::remove_file(path).expect("remove temporary file");
+    }
+
+    #[test]
+    fn local_clipboard_file_name_rejects_directories() {
+        let error = create_local_temporary_clipboard_file("../private.png", b"image")
+            .expect_err("path traversal must be rejected");
+        assert!(error.to_string().contains("文件名无效"));
     }
 
     // DEC private mode 1049: a program writes this to enter the alternate screen buffer.

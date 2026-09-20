@@ -167,6 +167,8 @@ pub trait RemoteClientDelegate: Send + Sync {
     fn set_transfer_progress(&self, _progress: Option<f32>, _cx: &mut AsyncApp) {}
 }
 
+pub const TEMPORARY_FILES_CAPABILITY: &str = "temporary_files_v1";
+
 const MAX_MISSED_HEARTBEATS: usize = 5;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1222,6 +1224,10 @@ impl RemoteClient {
 
     pub fn proto_client(&self) -> AnyProtoClient {
         self.client.clone().into()
+    }
+
+    pub fn supports_temporary_files(&self) -> bool {
+        self.client.supports_temporary_files.load(SeqCst)
     }
 
     pub fn connection_options(&self) -> RemoteConnectionOptions {
@@ -2483,6 +2489,7 @@ pub(crate) struct ChannelClient {
     name: &'static str,
     task: Mutex<Task<Result<()>>>,
     remote_started: Signal<()>,
+    supports_temporary_files: AtomicBool,
     session_invalidated: Arc<Signal<String>>,
     session_is_invalid: Arc<AtomicBool>,
     has_wsl_interop: bool,
@@ -2514,6 +2521,7 @@ impl ChannelClient {
                 &cx.to_async(),
             )),
             remote_started: Signal::new(cx),
+            supports_temporary_files: AtomicBool::new(false),
             session_invalidated: Arc::new(Signal::new(cx)),
             session_is_invalid: Arc::new(AtomicBool::new(false)),
             has_wsl_interop,
@@ -2531,7 +2539,10 @@ impl ChannelClient {
     ) -> Task<Result<()>> {
         cx.spawn(async move |cx| {
             if let Some(this) = this.upgrade() {
-                let envelope = proto::RemoteStarted {}.into_envelope(0, None, None);
+                let envelope = proto::RemoteStarted {
+                    capabilities: vec![TEMPORARY_FILES_CAPABILITY.to_string()],
+                }
+                .into_envelope(0, None, None);
                 this.outgoing_tx.lock().unbounded_send(envelope).ok();
             };
 
@@ -2567,7 +2578,14 @@ impl ChannelClient {
                     continue;
                 }
 
-                if let Some(proto::envelope::Payload::RemoteStarted(_)) = &incoming.payload {
+                if let Some(proto::envelope::Payload::RemoteStarted(started)) = &incoming.payload {
+                    this.supports_temporary_files.store(
+                        started
+                            .capabilities
+                            .iter()
+                            .any(|capability| capability == TEMPORARY_FILES_CAPABILITY),
+                        SeqCst,
+                    );
                     this.remote_started.set(());
                     let mut envelope = proto::Ack {}.into_envelope(0, Some(incoming.id), None);
                     envelope.id = this.next_message_id.fetch_add(1, SeqCst);

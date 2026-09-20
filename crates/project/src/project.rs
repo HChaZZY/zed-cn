@@ -2316,6 +2316,40 @@ impl Project {
         self.remote_client.clone()
     }
 
+    pub fn supports_temporary_files(&self, cx: &App) -> bool {
+        self.remote_client
+            .as_ref()
+            .is_some_and(|client| client.read(cx).supports_temporary_files())
+    }
+
+    pub fn create_temporary_file(
+        &self,
+        suggested_name: String,
+        content: Vec<u8>,
+        cx: &App,
+    ) -> Task<Result<PathBuf>> {
+        let Some(remote_client) = &self.remote_client else {
+            return Task::ready(Err(anyhow!("project is not connected to a remote server")));
+        };
+        if !remote_client.read(cx).supports_temporary_files() {
+            return Task::ready(Err(anyhow!(
+                "remote server does not support temporary clipboard files"
+            )));
+        }
+
+        let request = remote_client
+            .read(cx)
+            .proto_client()
+            .request(proto::CreateTemporaryFile {
+                suggested_name,
+                content,
+            });
+        cx.spawn(async move |_| {
+            let response = request.await?;
+            Ok(PathBuf::from(response.path))
+        })
+    }
+
     #[inline]
     pub fn user_store(&self) -> Entity<UserStore> {
         self.user_store.clone()
