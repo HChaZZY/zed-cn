@@ -87,6 +87,7 @@ pub struct CommitView {
     remote: Option<GitRemote>,
     is_shallow_boundary: bool,
     file_filter: Option<RepoPath>,
+    explanation_controller: Entity<crate::diff_explanations::DiffExplanationController>,
     _load_diff_task: Task<Result<()>>,
 }
 
@@ -342,6 +343,8 @@ impl CommitView {
             editor
         });
         let commit_sha = Arc::<str>::from(commit.sha.as_ref());
+        let explanation_controller =
+            cx.new(|_| crate::diff_explanations::DiffExplanationController::default());
 
         let repository_clone = repository.clone();
         let project_clone = project.clone();
@@ -498,6 +501,7 @@ impl CommitView {
                         });
                     });
                 }
+                this.schedule_explanations(cx);
             })?;
 
             anyhow::Ok(())
@@ -532,8 +536,73 @@ impl CommitView {
             remote,
             is_shallow_boundary,
             file_filter,
+            explanation_controller,
             _load_diff_task: load_diff_task,
         }
+    }
+
+    fn schedule_explanations(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.multibuffer.read(cx).snapshot(cx);
+        let mut files = Vec::new();
+        for (buffer_snapshot, _) in snapshot.buffers_with_paths() {
+            let Some(file) = buffer_snapshot.file() else {
+                continue;
+            };
+            let Some(diff) = snapshot.diff_for_buffer_id(buffer_snapshot.remote_id()) else {
+                continue;
+            };
+            let mut hunks = Vec::new();
+            for (index, hunk) in diff
+                .hunks_intersecting_range(
+                    language::Anchor::min_max_range_for_buffer(buffer_snapshot.remote_id()),
+                    buffer_snapshot,
+                )
+                .enumerate()
+            {
+                let old_range = hunk.diff_base_byte_range.clone();
+                let new_range = hunk.buffer_range.to_offset(buffer_snapshot);
+                let anchor = snapshot
+                    .anchor_in_excerpt(hunk.buffer_range.start)
+                    .unwrap_or(multi_buffer::Anchor::Min);
+                hunks.push(crate::diff_explanations::DiffHunkInput {
+                    identifier: index + 1,
+                    old_start_line: diff.base_text().offset_to_point(old_range.start).row,
+                    new_start_line: buffer_snapshot.offset_to_point(new_range.start).row,
+                    old_text: diff.base_text().text_for_range(old_range).collect(),
+                    new_text: buffer_snapshot.text_for_range(new_range).collect(),
+                    anchor,
+                });
+            }
+            if hunks.is_empty() {
+                continue;
+            }
+            let anchor = snapshot
+                .excerpts_for_buffer(buffer_snapshot.remote_id())
+                .next()
+                .and_then(|excerpt| snapshot.anchor_in_excerpt(excerpt.context.start))
+                .unwrap_or_else(|| hunks[0].anchor);
+            files.push(crate::diff_explanations::DiffFileInput {
+                path: file.path().display(PathStyle::local()).to_string(),
+                language: buffer_snapshot
+                    .language()
+                    .map(|language| language.name().to_string())
+                    .unwrap_or_default(),
+                old_text: diff.base_text().text(),
+                new_text: buffer_snapshot.text(),
+                hunks,
+                anchor,
+                private: file.is_private(),
+                worktree_id: file.worktree_id(cx),
+            });
+        }
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        crate::diff_explanations::DiffExplanationController::schedule(
+            &self.explanation_controller,
+            self.editor.read(cx).rhs_editor().clone(),
+            self.project.clone(),
+            files,
+            cx,
+        );
     }
 
     fn render_shallow_boundary_notice(&self, cx: &App) -> impl IntoElement {
@@ -1378,6 +1447,8 @@ impl Item for CommitView {
                 remote: self.remote.clone(),
                 is_shallow_boundary: self.is_shallow_boundary,
                 file_filter: self.file_filter.clone(),
+                explanation_controller: cx
+                    .new(|_| crate::diff_explanations::DiffExplanationController::default()),
                 _load_diff_task: Task::ready(Ok(())),
             }
         })))

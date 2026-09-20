@@ -366,7 +366,7 @@ fn active_request_count(scope: gpui::EntityId) -> usize {
         .unwrap_or_default()
 }
 
-fn resolve_model(settings: &CodeExplanationSettings, cx: &App) -> Result<ConfiguredModel> {
+pub fn resolve_model(settings: &CodeExplanationSettings, cx: &App) -> Result<ConfiguredModel> {
     let provider_id = settings
         .provider
         .as_ref()
@@ -386,7 +386,7 @@ fn resolve_model(settings: &CodeExplanationSettings, cx: &App) -> Result<Configu
     Ok(ConfiguredModel { provider, model })
 }
 
-fn selected_provider_configuration(settings: &CodeExplanationSettings, cx: &App) -> String {
+pub fn selected_provider_configuration(settings: &CodeExplanationSettings, cx: &App) -> String {
     let models = &cx
         .global::<settings::SettingsStore>()
         .merged_settings()
@@ -417,7 +417,7 @@ fn selected_provider_configuration(settings: &CodeExplanationSettings, cx: &App)
     content_hash(&format!("{provider}:{selected}:{openai:?}:{anthropic:?}"))
 }
 
-pub(crate) fn content_hash(text: &str) -> String {
+pub fn content_hash(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
