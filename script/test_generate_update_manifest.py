@@ -206,7 +206,19 @@ class ManifestTests(unittest.TestCase):
             directory = Path(temporary)
             (directory / "Zed-x86_64.exe").write_bytes(b"abc")
             (directory / "SHA256SUMS.txt").write_text("b" * 64 + "  Zed-x86_64.exe\n")
-            self.assertEqual(manifest.release_metadata(directory, "zed-cn-v1.18.1-r1", "a" * 40), metadata())
+            expected = metadata()
+            expected["title"] = "Zed CN 1.18.1 r1"
+            expected["release_notes"] = "# 本次更新\n\n- 自定义功能\n"
+            self.assertEqual(
+                manifest.release_metadata(
+                    directory,
+                    "zed-cn-v1.18.1-r1",
+                    "a" * 40,
+                    expected["title"],
+                    expected["release_notes"],
+                ),
+                expected,
+            )
 
 
 class CommandRetryTests(unittest.TestCase):

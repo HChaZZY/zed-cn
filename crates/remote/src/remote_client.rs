@@ -512,7 +512,8 @@ impl RemoteClient {
             let success = Box::pin(async move {
                 let (outgoing_tx, outgoing_rx) = mpsc::unbounded::<Envelope>();
                 let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
-                let (connection_activity_tx, connection_activity_rx) = mpsc::channel::<()>(1);
+                let (connection_activity_tx, mut connection_activity_rx) =
+                    mpsc::channel::<()>(1);
 
                 let client = cx.update(|cx| {
                     ChannelClient::new(
@@ -560,8 +561,8 @@ impl RemoteClient {
                 })
                 .detach();
 
-                let io_task = remote_connection.start_proxy(
-                    unique_identifier,
+                let mut io_task = remote_connection.start_proxy(
+                    unique_identifier.clone(),
                     false,
                     incoming_tx,
                     outgoing_rx,
@@ -572,10 +573,44 @@ impl RemoteClient {
                 );
 
                 delegate.set_status(Some("正在等待远程开发服务响应"), cx);
-                let ready = client
+                let mut ready = client
                     .wait_for_remote_started()
                     .with_timeout(INITIAL_CONNECTION_TIMEOUT, cx.background_executor())
                     .await;
+                if ready.is_err()
+                    && remote_connection.restart_unresponsive_server_on_initial_connect()
+                {
+                    log::warn!(
+                        "Zed CN remote server did not respond during initial connection; restarting it once"
+                    );
+                    delegate.set_status(
+                        Some("远程开发服务未响应，正在强制停止并重新启动"),
+                        cx,
+                    );
+                    drop(io_task);
+
+                    let (retry_outgoing_tx, retry_outgoing_rx) = mpsc::unbounded::<Envelope>();
+                    let (retry_incoming_tx, retry_incoming_rx) = mpsc::unbounded::<Envelope>();
+                    let (retry_connection_activity_tx, retry_connection_activity_rx) =
+                        mpsc::channel::<()>(1);
+                    client.reconnect(retry_incoming_rx, retry_outgoing_tx, cx);
+                    connection_activity_rx = retry_connection_activity_rx;
+                    io_task = remote_connection.start_proxy(
+                        unique_identifier,
+                        false,
+                        retry_incoming_tx,
+                        retry_outgoing_rx,
+                        client.outgoing_progress.clone(),
+                        retry_connection_activity_tx,
+                        delegate.clone(),
+                        cx,
+                    );
+                    delegate.set_status(Some("正在等待重新启动的远程开发服务响应"), cx);
+                    ready = client
+                        .wait_for_remote_started()
+                        .with_timeout(INITIAL_CONNECTION_TIMEOUT, cx.background_executor())
+                        .await;
+                }
                 match ready {
                     Ok(Some(_)) => {}
                     Ok(None) => {
@@ -2391,6 +2426,9 @@ pub trait RemoteConnection: Send + Sync {
         delegate: Arc<dyn RemoteClientDelegate>,
         cx: &mut AsyncApp,
     ) -> Task<Result<i32>>;
+    fn restart_unresponsive_server_on_initial_connect(&self) -> bool {
+        false
+    }
     fn upload_directory(
         &self,
         src_path: PathBuf,

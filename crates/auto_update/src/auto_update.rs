@@ -29,7 +29,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
-use util::command::new_command;
+use util::{ResultExt as _, command::new_command};
 use workspace::Workspace;
 
 const SHOULD_SHOW_UPDATE_NOTIFICATION_KEY: &str = "auto-updater-should-show-updated-notification";
@@ -214,7 +214,16 @@ struct GitHubRelease {
     target_commitish: String,
     draft: bool,
     prerelease: bool,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    release_notes: String,
     assets: Vec<GitHubReleaseAsset>,
+}
+
+pub struct CustomReleaseNotes {
+    pub title: String,
+    pub body: String,
 }
 
 #[derive(Clone, Deserialize, Debug)]
@@ -382,6 +391,12 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
 }
 
 pub fn release_notes_url(cx: &mut App) -> Option<String> {
+    if let Some(tag) = release_channel::CustomReleaseTag::current(cx) {
+        return Some(format!(
+            "https://github.com/rxp200/zed-cn/releases/tag/{tag}"
+        ));
+    }
+
     let release_channel = ReleaseChannel::try_global(cx)?;
     let url = match release_channel {
         ReleaseChannel::Stable | ReleaseChannel::Preview => {
@@ -406,6 +421,44 @@ pub fn view_release_notes(_: &ViewReleaseNotes, cx: &mut App) -> Option<()> {
     let url = release_notes_url(cx)?;
     cx.open_url(&url);
     None
+}
+
+pub async fn custom_release_notes(
+    client: Arc<dyn HttpClient>,
+    tag: &str,
+    executor: &BackgroundExecutor,
+) -> Option<CustomReleaseNotes> {
+    let mut response = client
+        .get(ZED_CN_RELEASES_URL, Default::default(), true)
+        .with_timeout(Duration::from_secs(30), executor)
+        .await
+        .log_err()?
+        .log_err()?;
+    if !response.status().is_success() {
+        return None;
+    }
+
+    let mut body = Vec::new();
+    response
+        .body_mut()
+        .take(UPDATE_MANIFEST_MAX_BYTES + 1)
+        .read_to_end(&mut body)
+        .with_timeout(Duration::from_secs(30), executor)
+        .await
+        .log_err()?
+        .log_err()?;
+    let manifest = parse_update_manifest(&body).log_err()?;
+    let release = manifest
+        .releases
+        .into_iter()
+        .find(|release| release.tag_name == tag)?;
+    if release.title.trim().is_empty() || release.release_notes.trim().is_empty() {
+        return None;
+    }
+    Some(CustomReleaseNotes {
+        title: release.title,
+        body: release.release_notes,
+    })
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -2365,6 +2418,11 @@ mod tests {
             }]
         });
         assert!(parse_update_manifest(&serde_json::to_vec(&value).unwrap()).is_ok());
+        value["releases"][0]["title"] = "Zed CN 1.18.1 r2".into();
+        value["releases"][0]["release_notes"] = "# 本次更新\n\n- 自定义功能".into();
+        let manifest = parse_update_manifest(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(manifest.releases[0].title, "Zed CN 1.18.1 r2");
+        assert!(manifest.releases[0].release_notes.contains("自定义功能"));
         value["schema_version"] = 2.into();
         assert!(parse_update_manifest(&serde_json::to_vec(&value).unwrap()).is_err());
         value["schema_version"] = 1.into();

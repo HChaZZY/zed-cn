@@ -83,7 +83,7 @@ def validate_release(release):
     return release
 
 
-def release_metadata(directory, tag, commit):
+def release_metadata(directory, tag, commit, title="", release_notes=""):
     checksums = {}
     for line in (directory / "SHA256SUMS.txt").read_text().splitlines():
         checksum, name = line.split(maxsplit=1)
@@ -99,7 +99,9 @@ def release_metadata(directory, tag, commit):
             })
     return validate_release({
         "tag_name": tag, "target_commitish": commit,
-        "draft": False, "prerelease": False, "assets": assets,
+        "draft": False, "prerelease": False,
+        "title": title, "release_notes": release_notes,
+        "assets": assets,
     })
 
 
@@ -146,10 +148,15 @@ def main():
     parser.add_argument("--release-directory", type=Path)
     parser.add_argument("--tag")
     parser.add_argument("--commit")
+    parser.add_argument("--title", default="")
+    parser.add_argument("--release-notes-file", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
     if arguments.release_directory:
-        result = release_metadata(arguments.release_directory, arguments.tag, arguments.commit)
+        release_notes = (arguments.release_notes_file.read_text()
+                         if arguments.release_notes_file else "")
+        result = release_metadata(arguments.release_directory, arguments.tag, arguments.commit,
+                                  arguments.title, release_notes)
     else:
         pages = json.loads(command("gh", "api", "--paginate", "--slurp", f"repos/{REPOSITORY}/releases?per_page=100"))
         releases = [release for page in pages for release in page]

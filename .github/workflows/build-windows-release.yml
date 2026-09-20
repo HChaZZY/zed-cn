@@ -755,6 +755,8 @@ jobs:
           python3 script/generate-update-manifest.py \
             --release-directory release-artifacts \
             --tag "$RELEASE_TAG" --commit "$SOURCE_SHA" \
+            --title "Zed CN $RELEASE_VERSION r$RELEASE_REVISION" \
+            --release-notes-file "$notes_path" \
             --output update-metadata.json
           verify_release_tag
           gh release upload "$RELEASE_TAG" update-metadata.json \

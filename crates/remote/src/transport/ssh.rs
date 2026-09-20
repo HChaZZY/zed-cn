@@ -54,6 +54,7 @@ const REMOTE_SERVER_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// on startup). Without this guard the connection modal would hang forever
 /// at the "detecting remote shell" step instead of failing with an error.
 const REMOTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const CUSTOM_SERVER_DIGEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn verify_custom_server_digest(output: &str, expected: &str) -> Result<bool> {
     let output = output.trim();
@@ -623,6 +624,10 @@ impl RemoteConnection for SshRemoteConnection {
             connection_activity_tx,
             cx,
         )
+    }
+
+    fn restart_unresponsive_server_on_initial_connect(&self) -> bool {
+        self.socket.connection_options.remote_server_source == settings::RemoteServerSource::ZedCn
     }
 
     fn path_style(&self) -> PathStyle {
@@ -1416,7 +1421,7 @@ impl SshRemoteConnection {
                 command,
                 &arguments,
                 true,
-                REMOTE_COMMAND_TIMEOUT,
+                CUSTOM_SERVER_DIGEST_TIMEOUT,
                 cx,
             )
             .await
