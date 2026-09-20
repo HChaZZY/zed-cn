@@ -292,6 +292,7 @@ pub enum IconName {
     UserGroup,
     UserRoundPen,
     Warning,
+    WarningCircle,
     WholeWord,
     XCircle,
     XCircleFilled,
