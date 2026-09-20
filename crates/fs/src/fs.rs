@@ -1269,7 +1269,7 @@ impl Fs for RealFs {
         let job_info = JobInfo {
             id: job_id,
             start: Instant::now(),
-            message: SharedString::from(format!("Cloning {}", repo_url)),
+            message: SharedString::from(format!("正在克隆 {}", repo_url)),
         };
 
         let job_tracker = JobTracker::new(job_info, self.job_event_subscribers.clone());
@@ -1280,19 +1280,16 @@ impl Fs for RealFs {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
-        let stderr = child
-            .stderr
-            .take()
-            .context("failed to read git clone progress")?;
+        let stderr = child.stderr.take().context("无法读取 Git 克隆进度")?;
         let stderr_output = git_clone_progress::read(stderr, |message| {
-            job_tracker.update(message.into());
+            job_tracker.update(git_clone_progress::localized_progress(&message).into());
         })
         .await?;
         let status = child.status().await?;
 
         if !status.success() {
             anyhow::bail!(
-                "git clone failed: {}",
+                "Git 克隆失败：{}",
                 git_clone_progress::failure_message(&stderr_output)
             );
         }

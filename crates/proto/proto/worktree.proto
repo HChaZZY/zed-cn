@@ -101,6 +101,15 @@ message CreateProjectEntry {
   optional bytes content = 5;
 }
 
+message CreateTemporaryFile {
+  string suggested_name = 1;
+  bytes content = 2;
+}
+
+message CreateTemporaryFileResponse {
+  string path = 1;
+}
+
 message RenameProjectEntry {
   uint64 project_id = 1;
   uint64 entry_id = 2;

@@ -305,6 +305,12 @@ pub struct SettingsContent {
 
     pub title_bar: Option<TitleBarSettingsContent>,
 
+    /// Configuration for AI-powered translation in the editor's hover popovers.
+    pub hover_translation: Option<HoverTranslationSettingsContent>,
+
+    /// Read-only AI explanations displayed above code. User configuration only.
+    pub code_explanations: Option<CodeExplanationSettingsContent>,
+
     /// Whether or not to enable Vim mode.
     ///
     /// Default: false
@@ -409,7 +415,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         journal, log, line_indicator_format, language_models, outline_panel, project_panel,
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
         title_bar, vim_mode, calls, which_key, vim, modeline_lines, feature_flags,
-        instrumentation,
+        instrumentation, hover_translation, code_explanations,
     },
     defaults: {},
 });
@@ -1359,6 +1365,14 @@ pub struct RemoteSettingsContent {
     pub wsl_connections: Option<Vec<WslConnection>>,
     pub dev_container_connections: Option<Vec<DevContainerConnection>>,
     pub read_ssh_config: Option<bool>,
+    /// Whether SSH remote server binaries should be downloaded by the local Zed client and then
+    /// uploaded over SSH, without first attempting a download from the remote host.
+    ///
+    /// This is useful for servers that cannot access Zed's release assets directly. The local
+    /// download uses Zed's configured proxy.
+    ///
+    /// Default: false
+    pub china_server_adaptation: Option<bool>,
     pub use_podman: Option<bool>,
     /// Whether to build dev container images with BuildKit.
     ///
@@ -1400,13 +1414,26 @@ pub struct SshConnection {
     // By default Zed will download the binary to the host directly.
     // If this is set to true, Zed will download the binary to your local machine,
     // and then upload it over the SSH connection. Useful if your SSH server has
-    // limited outbound internet access.
+    // limited outbound internet access. The global `china_server_adaptation`
+    // setting forces this behavior for every SSH connection.
     pub upload_binary_over_ssh: Option<bool>,
+    /// Selects the Remote Server distribution for this SSH host.
+    pub remote_server_source: Option<RemoteServerSource>,
 
     pub port_forwards: Option<Vec<SshPortForwardOption>>,
     /// Timeout in seconds for SSH connection and downloading the remote server binary.
     /// Defaults to 10 seconds if not specified.
     pub connection_timeout: Option<u16>,
+}
+
+#[derive(
+    Clone, Copy, Default, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, JsonSchema, MergeFrom,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteServerSource {
+    #[default]
+    Official,
+    ZedCn,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, JsonSchema, MergeFrom, Debug)]
@@ -1507,8 +1534,6 @@ impl<T: Clone> merge_from::MergeFrom for ExtendingVec<T> {
     }
 }
 
-pub const REST_OF_FILE_SCAN_EXCLUSIONS: &str = "...";
-
 // A SplicingVec in the settings replaces the value it merges over, except that
 // a `...` entry expands to that previous value.
 //
@@ -1521,6 +1546,10 @@ pub const REST_OF_FILE_SCAN_EXCLUSIONS: &str = "...";
 // repeating it.
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SplicingVec(pub Vec<String>);
+
+impl SplicingVec {
+    pub const REST: &str = "...";
+}
 
 impl From<Vec<String>> for SplicingVec {
     fn from(vec: Vec<String>) -> Self {
@@ -1535,7 +1564,7 @@ impl merge_from::MergeFrom for SplicingVec {
             .0
             .iter()
             .flat_map(|entry| {
-                if entry == REST_OF_FILE_SCAN_EXCLUSIONS {
+                if entry == Self::REST {
                     inherited.clone()
                 } else {
                     vec![entry.clone()]
