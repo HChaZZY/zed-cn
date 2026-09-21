@@ -69,6 +69,7 @@
       "ctrl-y": "editor::KillRingYank",
       "cmd-k cmd-q": "editor::Rewrap",
       "cmd-k q": "editor::Rewrap",
+      "ctrl-alt-t": "editor::TranslateSelection",
       "cmd-backspace": "editor::DeleteToBeginningOfLine",
       "cmd-delete": "editor::DeleteToEndOfLine",
       "alt-backspace": ["editor::DeleteToPreviousWordStart", { "ignore_newlines": false, "ignore_brackets": false }],
@@ -146,6 +147,8 @@
       "cmd-i": "editor::ShowSignatureHelp",
       "f9": "editor::ToggleBreakpoint",
       "shift-f9": "editor::EditLogBreakpoint",
+      // 有选区时运行选中代码，否则保存并运行当前文件。
+      "ctrl-alt-n": "editor::RunCode",
       "ctrl-f12": "editor::GoToDeclaration",
       "alt-ctrl-f12": "editor::GoToDeclarationSplit",
       "ctrl-cmd-e": "editor::ToggleEditPrediction",
@@ -589,7 +592,7 @@
       "cmd-k ctrl-cmd-d": ["editor::SelectPrevious", { "replace_newest": true }], // editor.action.moveSelectionToPreviousFindMatch
       "cmd-k cmd-i": "editor::Hover",
       "cmd-k cmd-b": "editor::BlameHover",
-      "cmd-/": ["editor::ToggleComments", { "advance_downwards": false }],
+      "cmd-/": ["editor::ToggleComments", { "advance_downwards": false, "comment_empty_lines": true }],
       "cmd-k cmd-/": "editor::ToggleBlockComments",
       "shift-alt-a": "editor::ToggleBlockComments",
       "f8": ["editor::GoToDiagnostic", { "severity": { "min": "hint", "max": "error" } }],
@@ -781,6 +784,10 @@
       // Use the `"reevaluate_context"` parameter to control this.
       "cmd-alt-r": ["task::Rerun", { "reevaluate_context": false }],
       "ctrl-alt-shift-r": ["task::Spawn", { "reveal_target": "center" }],
+      // Spawns the task tagged "run-current" (e.g. a "run current file" task);
+      // falls back to the task picker when no matching task is found.
+      "ctrl-alt-m": ["task::Spawn", { "task_tag": "run-current" }],
+      "ctrl-alt-shift-j": "editor::StopCode",
       // also possible to spawn tasks by name:
       // "foo-bar": ["task::Spawn", { "task_name": "MyTask", "reveal_target": "dock" }]
       // or by tag:
@@ -1054,6 +1061,7 @@
       "alt-d": "project_panel::CompareMarkedFiles",
       "cmd-alt-backspace": ["project_panel::Delete", { "skip_prompt": false }],
       "cmd-alt-shift-f": "project_panel::NewSearchInDirectory",
+      "shift-f10": "project_panel::OpenContextMenu",
       "shift-down": "menu::SelectNext",
       "shift-up": "menu::SelectPrevious",
       "escape": "menu::Cancel",
@@ -1273,6 +1281,13 @@
       // ToggleActionsMenu) live in keymaps/specific-overrides-macos.json, which
       // is loaded after the base keymap so they win over conflicting base-keymap
       // Editor bindings.
+    },
+  },
+  {
+    "context": "LspCommandSelector > Picker > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "tab": "lsp_command_selector::ToggleArgumentsFocus",
     },
   },
   {
