@@ -947,6 +947,8 @@ pub fn translate_action_name(name: &str) -> Option<&'static str> {
         "copilot::Reinstall" => Some("Copilot: 重新安装"),
         "copilot::SignIn" => Some("Copilot: 登录"),
         "copilot::Suggest" => Some("Copilot: 建议"),
+        // === copilot_edit_predictions ===
+        "copilot_edit_predictions::Reinstall" => Some("Copilot 编辑预测: 重新安装"),
         // === project_search ===
         "project_search::NextField" => Some("项目搜索: 下一个输入框"),
         "project_search::SearchInNew" => Some("项目搜索: 在新标签中搜索"),
@@ -1041,6 +1043,14 @@ pub fn translate_action_name(name: &str) -> Option<&'static str> {
         "worktree_picker::DeleteWorktree" => Some("工作树选择器: 删除工作树"),
         // === csv ===
         "csv::OpenPreview" => Some("CSV 预览: 打开预览"),
+        // === markdown ===
+        "markdown::CloseAndReturnToEditor" => Some("Markdown: 关闭预览并返回编辑器"),
+        "markdown::OpenFollowingPreview" => Some("Markdown: 打开跟随预览"),
+        "markdown::OpenPreview" => Some("Markdown: 打开预览"),
+        "markdown::OpenPreviewToTheSide" => Some("Markdown: 在侧边打开预览"),
+        // === tabular_data ===
+        "tabular_data::OpenPreview" => Some("表格数据: 打开预览"),
+        "tabular_data::OpenPreviewToTheSide" => Some("表格数据: 在侧边打开预览"),
         // === theme_selector ===
         "theme_selector::Toggle" => Some("主题选择器: 切换"),
         // === snippets ===
@@ -1066,8 +1076,15 @@ pub fn translate_action_name(name: &str) -> Option<&'static str> {
         // === toolchain ===
         "toolchain::Select" => Some("工具链: 选择"),
         // === svg ===
+        "svg::OpenFollowingPreview" => Some("SVG: 打开跟随预览"),
         "svg::OpenPreview" => Some("SVG: 打开预览"),
         "svg::OpenPreviewToTheSide" => Some("SVG: 在侧边打开预览"),
+        // === dev ===
+        "dev::DumpInputLatencyHistogram" => Some("开发工具: 导出输入延迟直方图"),
+        "dev::OpenEditPredictionContextView" => Some("开发工具: 打开编辑预测上下文视图"),
+        "dev::OpenThemePreview" => Some("开发工具: 打开主题预览"),
+        // === zed_predict_onboarding ===
+        "zed_predict_onboarding::OpenZedPredictOnboarding" => Some("Zed Predict: 打开入门引导"),
         // === notebook ===
         "notebook::AddCodeBlock" => Some("笔记本: 添加代码块"),
         "notebook::AddMarkdownBlock" => Some("笔记本: 添加 Markdown 块"),
@@ -1336,7 +1353,9 @@ pub fn translate_action_namespace(namespace: &str) -> Option<&'static str> {
         "collab_panel" => Some("协作面板"),
         "command_palette" => Some("命令面板"),
         "copilot" => Some("Copilot"),
+        "copilot_edit_predictions" => Some("Copilot 编辑预测"),
         "csv" => Some("CSV 预览"),
+        "dev" => Some("开发工具"),
         "debug_panel" => Some("调试面板"),
         "debugger" => Some("调试器"),
         "diagnostics" => Some("诊断"),
@@ -1356,6 +1375,7 @@ pub fn translate_action_namespace(namespace: &str) -> Option<&'static str> {
         "keymap_editor" => Some("快捷键编辑器"),
         "menu" => Some("菜单"),
         "multi_workspace" => Some("多工作区"),
+        "markdown" => Some("Markdown"),
         "notebook" => Some("笔记本"),
         "onboarding" => Some("入门引导"),
         "outline_panel" => Some("大纲面板"),
@@ -1375,6 +1395,7 @@ pub fn translate_action_namespace(namespace: &str) -> Option<&'static str> {
         "snippets" => Some("代码片段"),
         "stash_picker" => Some("暂存选择器"),
         "svg" => Some("SVG"),
+        "tabular_data" => Some("表格数据"),
         "tab_switcher" => Some("标签切换器"),
         "task" => Some("任务"),
         "terminal" => Some("终端"),
@@ -1386,6 +1407,7 @@ pub fn translate_action_namespace(namespace: &str) -> Option<&'static str> {
         "vim" => Some("Vim"),
         "welcome" => Some("欢迎页"),
         "worktree_picker" => Some("工作树选择器"),
+        "zed_predict_onboarding" => Some("Zed Predict"),
         _ => None,
     }
 }

@@ -3,7 +3,8 @@ use collections::HashSet;
 use editor::{
     Editor,
     code_explanations::{
-        CodeExplanationSettings, content_hash, resolve_model, selected_provider_configuration,
+        CodeExplanationRequestWaiter, CodeExplanationSettings, content_hash, resolve_model,
+        selected_provider_configuration,
     },
     display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId},
 };
@@ -15,8 +16,14 @@ use language_model::{
 use project::Project;
 use serde::Deserialize;
 use settings::Settings as _;
-use std::{sync::Arc, time::Duration};
-use ui::prelude::*;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+use ui::{Disclosure, Tooltip, prelude::*};
 
 const CONTEXT_LINES: u32 = 80;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
@@ -68,17 +75,6 @@ struct FileExplanation {
 struct HunkExplanation {
     id: usize,
     explanation: String,
-}
-
-#[derive(Deserialize)]
-struct OverallExplanation {
-    purpose: String,
-    #[serde(default)]
-    behavior_changes: Vec<String>,
-    #[serde(default)]
-    risks: Vec<String>,
-    #[serde(default)]
-    test_suggestions: Vec<String>,
 }
 
 impl DiffExplanationController {
@@ -137,7 +133,7 @@ impl DiffExplanationController {
             controller.identity = identity.clone();
             controller.generation = controller.generation.wrapping_add(1);
             let generation = controller.generation;
-            controller.insert_status(&editor, "AI 正在分析全部修改及跨文件影响……".into(), cx);
+            controller.insert_status(&editor, "AI 正在分析各文件修改……".into(), cx);
             controller.task = Some(cx.spawn({
                 let editor = editor.downgrade();
                 let project = project.downgrade();
@@ -151,6 +147,7 @@ impl DiffExplanationController {
                         provider_configuration,
                         eligible.clone(),
                         project.clone(),
+                        editor.clone(),
                         cx,
                     )
                     .await;
@@ -166,13 +163,9 @@ impl DiffExplanationController {
                         }
                         controller.remove_blocks(&editor, cx);
                         match result {
-                            Ok((overall, explanations)) => controller.render_results(
-                                &editor,
-                                &eligible,
-                                overall,
-                                explanations,
-                                cx,
-                            ),
+                            Ok(explanations) => {
+                                controller.render_results(&editor, &eligible, explanations, cx)
+                            }
                             Err(error) => controller.insert_status(
                                 &editor,
                                 format!("AI 修改分析失败：{error}"),
@@ -200,7 +193,7 @@ impl DiffExplanationController {
     }
 
     fn insert_status(&mut self, editor: &Entity<Editor>, text: String, cx: &mut App) {
-        self.insert_block(editor, multi_buffer::Anchor::Min, text, true, cx);
+        self.insert_block(editor, multi_buffer::Anchor::Min, text, true, false, cx);
     }
 
     fn insert_block(
@@ -209,42 +202,78 @@ impl DiffExplanationController {
         anchor: multi_buffer::Anchor,
         text: String,
         prominent: bool,
+        collapsible: bool,
         cx: &mut App,
     ) {
-        let ids = editor.update(cx, |editor, cx| {
-            editor.insert_blocks(
-                [BlockProperties {
-                    placement: BlockPlacement::Above(anchor),
-                    height: Some(1),
-                    style: BlockStyle::Flex,
-                    priority: if prominent { 2 } else { 1 },
-                    render: Arc::new(move |cx| {
-                        v_flex()
-                            .w(cx.max_width)
-                            .pl(cx.anchor_x)
-                            .pr_3()
-                            .py_1()
-                            .gap_0p5()
-                            .border_l_2()
-                            .border_color(if prominent {
-                                cx.theme().colors().border_focused
-                            } else {
-                                cx.theme().status().success
-                            })
-                            .bg(cx
-                                .theme()
-                                .colors()
-                                .editor_subheader_background
-                                .opacity(0.72))
-                            .text_color(cx.theme().colors().text_muted)
-                            .child(text.clone())
-                            .into_any_element()
-                    }),
-                }],
-                None,
-                cx,
-            )
-        });
+        let expanded = Arc::new(AtomicBool::new(!collapsible));
+        let ids =
+            editor.update(cx, |editor, cx| {
+                editor.insert_blocks(
+                    [BlockProperties {
+                        placement: BlockPlacement::Above(anchor),
+                        height: Some(1),
+                        style: BlockStyle::Flex,
+                        priority: if prominent { 2 } else { 1 },
+                        render: Arc::new(move |cx| {
+                            let is_expanded = expanded.load(Ordering::SeqCst);
+                            let text = text.clone();
+                            let expanded = expanded.clone();
+                            v_flex()
+                                .w(cx.max_width)
+                                .pl(cx.anchor_x)
+                                .pr_3()
+                                .py_1()
+                                .gap_0p5()
+                                .border_l_2()
+                                .border_color(if prominent {
+                                    cx.theme().colors().border_focused
+                                } else {
+                                    cx.theme().status().success
+                                })
+                                .bg(cx
+                                    .theme()
+                                    .colors()
+                                    .editor_subheader_background
+                                    .opacity(0.72))
+                                .text_color(cx.theme().colors().text_muted)
+                                .when(collapsible, |element| {
+                                    element.child(
+                                        h_flex()
+                                            .min_w_0()
+                                            .gap_1()
+                                            .child(
+                                                Disclosure::new(
+                                                    gpui::ElementId::from(cx.block_id),
+                                                    is_expanded,
+                                                )
+                                                .tooltip(Tooltip::text(if is_expanded {
+                                                    "收起文件讲解"
+                                                } else {
+                                                    "展开文件讲解"
+                                                }))
+                                                .on_click(move |_, window, _| {
+                                                    expanded.fetch_xor(true, Ordering::SeqCst);
+                                                    window.refresh();
+                                                }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .when(!is_expanded, |element| {
+                                                        element.h(cx.line_height).overflow_hidden()
+                                                    })
+                                                    .child(text.clone()),
+                                            ),
+                                    )
+                                })
+                                .when(!collapsible, |element| element.child(text.clone()))
+                                .into_any_element()
+                        }),
+                    }],
+                    None,
+                    cx,
+                )
+            });
         self.blocks.extend(ids);
     }
 
@@ -252,22 +281,15 @@ impl DiffExplanationController {
         &mut self,
         editor: &Entity<Editor>,
         files: &[DiffFileInput],
-        overall: OverallExplanation,
         explanations: Vec<FileExplanation>,
         cx: &mut App,
     ) {
-        let mut overview = format!("✦ AI 变更概览\n目的：{}", overall.purpose.trim());
-        append_items(&mut overview, "行为变化", &overall.behavior_changes);
-        append_items(&mut overview, "风险与注意", &overall.risks);
-        append_items(&mut overview, "测试建议", &overall.test_suggestions);
-        self.insert_block(editor, multi_buffer::Anchor::Min, overview, true, cx);
-
         for (file, explanation) in files.iter().zip(explanations) {
-            let mut text = format!("✦ {}\n{}", file.path, explanation.summary.trim());
+            let mut text = format!("✦ {} — {}", file.path, explanation.summary.trim());
             append_items(&mut text, "做了什么", &explanation.changes);
             append_items(&mut text, "作用", &explanation.effects);
             append_items(&mut text, "风险与建议", &explanation.risks);
-            self.insert_block(editor, file.anchor, text, true, cx);
+            self.insert_block(editor, file.anchor, text, true, true, cx);
 
             for hunk in &file.hunks {
                 if let Some(explanation) = explanation
@@ -283,6 +305,7 @@ impl DiffExplanationController {
                             hunk.identifier,
                             explanation.explanation.trim()
                         ),
+                        false,
                         false,
                         cx,
                     );
@@ -343,8 +366,12 @@ async fn analyze_files(
     provider_configuration: String,
     files: Vec<DiffFileInput>,
     project: gpui::WeakEntity<Project>,
+    editor: gpui::WeakEntity<Editor>,
     cx: &mut gpui::AsyncApp,
-) -> Result<(OverallExplanation, Vec<FileExplanation>)> {
+) -> Result<Vec<FileExplanation>> {
+    let Some(project_id) = project.upgrade().map(|project| project.entity_id()) else {
+        anyhow::bail!("项目已关闭");
+    };
     let mut explanations = Vec::with_capacity(files.len());
     for file in &files {
         ensure_authorized(&settings, &provider_configuration, &project, file, cx)?;
@@ -353,41 +380,31 @@ async fn analyze_files(
             model.model.max_token_count().min(usize::MAX as u64) as usize,
             |text| model.model.estimate_tokens(text).min(usize::MAX as u64) as usize,
         )?;
-        let output =
-            request_json(&model, &settings.target_language, file_prompt(), prompt, cx).await?;
+        let request_key = format!("git-diff:{}", file_identity(file));
+        let waiting = CodeExplanationRequestWaiter::new(project_id, request_key, 1)?;
+        let permit = loop {
+            if let Some(permit) = waiting.acquire(settings.max_concurrent_requests as usize) {
+                editor.update(cx, |_, cx| cx.notify()).ok();
+                break permit;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
+            ensure_authorized(&settings, &provider_configuration, &project, file, cx)?;
+        };
+        drop(waiting);
+        let request_result =
+            request_json(&model, &settings.target_language, file_prompt(), prompt, cx).await;
+        drop(permit);
+        editor.update(cx, |_, cx| cx.notify()).ok();
+        let output = request_result?;
         ensure_authorized(&settings, &provider_configuration, &project, file, cx)?;
         let explanation = parse_json::<FileExplanation>(&output)?;
         validate_hunk_explanations(file, &explanation)?;
         explanations.push(explanation);
     }
 
-    let summary_input = explanations
-        .iter()
-        .zip(&files)
-        .map(|(explanation, file)| {
-            format!(
-                "文件：{}\n摘要：{}\n作用：{}\n风险：{}",
-                file.path,
-                explanation.summary,
-                explanation.effects.join("；"),
-                explanation.risks.join("；")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    if let Some(first_file) = files.first() {
-        ensure_authorized(&settings, &provider_configuration, &project, first_file, cx)?;
-    }
-    let output = request_json(
-        &model,
-        &settings.target_language,
-        overall_prompt(),
-        summary_input,
-        cx,
-    )
-    .await?;
-    let overall = parse_json::<OverallExplanation>(&output)?;
-    Ok((overall, explanations))
+    Ok(explanations)
 }
 
 fn ensure_authorized(
@@ -510,10 +527,6 @@ fn validate_hunk_explanations(file: &DiffFileInput, explanation: &FileExplanatio
 
 fn file_prompt() -> &'static str {
     "分析同一文件内的全部修改块及其相互关系。输出对象：{\"summary\":\"一句话文件摘要\",\"changes\":[\"做了什么\"],\"effects\":[\"有什么作用或行为变化\"],\"risks\":[\"风险、遗漏、重复实现或测试建议\"],\"hunks\":[{\"id\":1,\"explanation\":\"这个修改块做了什么、为何需要、与同文件其他块有什么关系\"}]}。每个输入修改块必须恰好对应一个 hunk，id 原样返回。"
-}
-
-fn overall_prompt() -> &'static str {
-    "根据所有文件摘要归纳整个变更集，识别跨文件目的、行为变化、重复实现和测试缺口。输出对象：{\"purpose\":\"整体目的\",\"behavior_changes\":[\"可观察行为变化\"],\"risks\":[\"跨文件风险或注意事项\"],\"test_suggestions\":[\"建议验证的场景\"]}。"
 }
 
 fn build_file_prompt(

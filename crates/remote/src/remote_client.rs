@@ -164,6 +164,7 @@ pub trait RemoteClientDelegate: Send + Sync {
         Task::ready(Err(anyhow::anyhow!("当前连接不支持下载 Zed CN 远程服务")))
     }
     fn set_status(&self, status: Option<&str>, cx: &mut AsyncApp);
+    fn append_connection_log(&self, _line: &str, _cx: &mut AsyncApp) {}
     fn set_transfer_progress(&self, _progress: Option<f32>, _cx: &mut AsyncApp) {}
 }
 

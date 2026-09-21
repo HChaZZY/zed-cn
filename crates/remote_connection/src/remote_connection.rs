@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::VecDeque, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use askpass::EncryptedPassword;
@@ -28,6 +28,7 @@ pub struct RemoteConnectionPrompt {
     is_devcontainer: bool,
     status_message: Option<SharedString>,
     transfer_progress: Option<f32>,
+    connection_log: VecDeque<SharedString>,
     prompt: Option<(Entity<Markdown>, oneshot::Sender<EncryptedPassword>)>,
     prompt_cancellation_task: Option<Task<()>>,
     cancellation: Option<oneshot::Sender<()>>,
@@ -73,6 +74,7 @@ impl RemoteConnectionPrompt {
             editor,
             status_message: None,
             transfer_progress: None,
+            connection_log: VecDeque::new(),
             cancellation: None,
             prompt: None,
             prompt_cancellation_task: None,
@@ -114,13 +116,34 @@ impl RemoteConnectionPrompt {
     }
 
     pub fn set_status(&mut self, status: Option<String>, cx: &mut Context<Self>) {
-        self.status_message = status.map(|s| s.into());
+        if let Some(status) = status.as_deref()
+            && self.connection_log.back().map(AsRef::as_ref) != Some(status)
+        {
+            self.push_connection_log_line(status);
+        }
+        self.status_message = status.map(Into::into);
         self.transfer_progress = None;
         cx.notify();
     }
 
     pub fn set_transfer_progress(&mut self, progress: Option<f32>, cx: &mut Context<Self>) {
         self.transfer_progress = progress.map(|progress| progress.clamp(0.0, 1.0));
+        cx.notify();
+    }
+
+    fn push_connection_log_line(&mut self, line: &str) {
+        const MAX_CONNECTION_LOG_LINES: usize = 10;
+
+        if self.connection_log.len() == MAX_CONNECTION_LOG_LINES {
+            self.connection_log.pop_front();
+        }
+        self.connection_log.push_back(line.to_owned().into());
+    }
+
+    pub fn append_connection_log(&mut self, line: String, cx: &mut Context<Self>) {
+        for line in line.lines().filter(|line| !line.trim().is_empty()) {
+            self.push_connection_log_line(line.trim());
+        }
         cx.notify();
     }
 
@@ -258,6 +281,59 @@ impl Render for RemoteConnectionPrompt {
                                 1.0,
                                 cx,
                             ))
+                        })
+                        .when(!self.connection_log.is_empty(), |this| {
+                            this.child(
+                                v_flex()
+                                    .mt_1()
+                                    .w_full()
+                                    .h(rems(10.5))
+                                    .overflow_hidden()
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(cx.theme().colors().border_variant)
+                                    .bg(cx.theme().colors().terminal_background)
+                                    .child(
+                                        h_flex()
+                                            .h(rems(2.))
+                                            .px_2()
+                                            .gap_1()
+                                            .border_b_1()
+                                            .border_color(cx.theme().colors().border_variant)
+                                            .child(
+                                                Icon::new(IconName::Terminal)
+                                                    .size(IconSize::XSmall)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(
+                                                Label::new("连接详情")
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Muted),
+                                            ),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .flex_1()
+                                            .min_h_0()
+                                            .justify_end()
+                                            .px_2()
+                                            .py_1()
+                                            .overflow_hidden()
+                                            .font(theme.buffer_font.clone())
+                                            .text_xs()
+                                            .text_color(cx.theme().colors().terminal_foreground)
+                                            .children(self.connection_log.iter().cloned().map(
+                                                |line| {
+                                                    div()
+                                                        .w_full()
+                                                        .overflow_hidden()
+                                                        .text_ellipsis()
+                                                        .whitespace_nowrap()
+                                                        .child(line)
+                                                },
+                                            )),
+                                    ),
+                            )
                         }),
                 )
             })
@@ -401,7 +477,7 @@ impl Render for RemoteConnectionModal {
 
         v_flex()
             .elevation_3(cx)
-            .w(rems(34.))
+            .w(rems(42.))
             .border_1()
             .border_color(theme.colors().border)
             .key_context("SshConnectionModal")
@@ -534,6 +610,14 @@ impl remote::RemoteClientDelegate for RemoteClientDelegate {
 
     fn set_status(&self, status: Option<&str>, cx: &mut AsyncApp) {
         self.update_status(status, cx)
+    }
+
+    fn append_connection_log(&self, line: &str, cx: &mut AsyncApp) {
+        self.ui
+            .update(cx, |prompt, cx| {
+                prompt.append_connection_log(line.to_owned(), cx);
+            })
+            .ok();
     }
 
     fn set_transfer_progress(&self, progress: Option<f32>, cx: &mut AsyncApp) {
@@ -850,6 +934,24 @@ mod tests {
                 })
             })
             .expect("test window should remain open");
+
+        prompt.update(cx, |prompt, cx| {
+            for index in 0..12 {
+                prompt.append_connection_log(format!("line {index}"), cx);
+            }
+        });
+        assert_eq!(
+            prompt.read_with(cx, |prompt, _| prompt.connection_log.len()),
+            10
+        );
+        assert_eq!(
+            prompt.read_with(cx, |prompt, _| prompt.connection_log.front().cloned()),
+            Some(SharedString::from("line 2"))
+        );
+        assert_eq!(
+            prompt.read_with(cx, |prompt, _| prompt.connection_log.back().cloned()),
+            Some(SharedString::from("line 11"))
+        );
 
         prompt.update(cx, |prompt, cx| {
             prompt.set_transfer_progress(Some(1.5), cx);

@@ -58,9 +58,9 @@ static WAITERS: std::sync::Mutex<Vec<(u64, gpui::EntityId, String, u8, std::time
     std::sync::Mutex::new(Vec::new());
 static NEXT_WAITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-struct RequestWaiter(u64);
-impl RequestWaiter {
-    fn new(scope: gpui::EntityId, key: String, priority: u8) -> Result<Self> {
+pub struct CodeExplanationRequestWaiter(u64);
+impl CodeExplanationRequestWaiter {
+    pub fn new(scope: gpui::EntityId, key: String, priority: u8) -> Result<Self> {
         let identifier = NEXT_WAITER.fetch_add(1, Ordering::SeqCst);
         WAITERS
             .lock()
@@ -69,7 +69,7 @@ impl RequestWaiter {
         Ok(Self(identifier))
     }
 
-    fn acquire(&self, maximum: usize) -> Option<RequestPermit> {
+    pub fn acquire(&self, maximum: usize) -> Option<CodeExplanationRequestPermit> {
         let waiters = WAITERS.lock().ok()?;
         let active_requests = ACTIVE_REQUESTS.lock().ok()?;
         let (_, scope, _, _, _) = waiters
@@ -90,7 +90,7 @@ impl RequestWaiter {
         let scope = *scope;
         let key = key.clone();
         drop(active_requests);
-        RequestPermit::acquire(scope, key, maximum)
+        CodeExplanationRequestPermit::acquire(scope, key, maximum)
     }
 }
 fn next_waiter<'a>(
@@ -111,7 +111,7 @@ fn next_waiter<'a>(
         })
 }
 
-impl Drop for RequestWaiter {
+impl Drop for CodeExplanationRequestWaiter {
     fn drop(&mut self) {
         if let Ok(mut waiters) = WAITERS.lock() {
             waiters.retain(|(identifier, _, _, _, _)| *identifier != self.0);
@@ -238,11 +238,11 @@ struct GlobalProjectScans(gpui::Entity<ProjectScanRegistry>);
 
 impl gpui::Global for GlobalProjectScans {}
 
-struct RequestPermit {
+pub struct CodeExplanationRequestPermit {
     scope: gpui::EntityId,
     key: String,
 }
-impl RequestPermit {
+impl CodeExplanationRequestPermit {
     fn acquire(scope: gpui::EntityId, key: String, maximum: usize) -> Option<Self> {
         let mut active_requests = ACTIVE_REQUESTS.lock().ok()?;
         let active = active_requests.entry(scope).or_default();
@@ -253,7 +253,7 @@ impl RequestPermit {
         Some(Self { scope, key })
     }
 }
-impl Drop for RequestPermit {
+impl Drop for CodeExplanationRequestPermit {
     fn drop(&mut self) {
         if let Ok(mut active_requests) = ACTIVE_REQUESTS.lock()
             && let Some(active) = active_requests.get_mut(&self.scope)
@@ -867,8 +867,11 @@ pub(crate) fn schedule(editor: &mut Editor, window: &gpui::Window, cx: &mut Cont
             };
             let request_key = format!("{cache_namespace}:{key}");
             let permit = if cached.is_none() {
-                let waiting = match RequestWaiter::new(project.entity_id(), request_key.clone(), 1)
-                {
+                let waiting = match CodeExplanationRequestWaiter::new(
+                    project.entity_id(),
+                    request_key.clone(),
+                    1,
+                ) {
                     Ok(waiting) => waiting,
                     Err(error) => {
                         log::error!("{error}");
@@ -1664,6 +1667,24 @@ mod tests {
     }
 
     #[test]
+    fn public_admission_counts_and_limits_requests_per_project() {
+        let scope = gpui::EntityId::from(9_001);
+        let first = CodeExplanationRequestWaiter::new(scope, "source".into(), 1).unwrap();
+        let second = CodeExplanationRequestWaiter::new(scope, "git-diff".into(), 1).unwrap();
+        let first_permit = first.acquire(1).expect("first request should be admitted");
+        assert_eq!(active_request_count(scope), 1);
+        assert!(second.acquire(1).is_none());
+        drop(first);
+        drop(first_permit);
+        let second_permit = second
+            .acquire(1)
+            .expect("Git Diff should share the released project slot");
+        assert_eq!(active_request_count(scope), 1);
+        drop(second_permit);
+        assert_eq!(active_request_count(scope), 0);
+    }
+
+    #[test]
     fn cache_hash_is_stable_and_content_sensitive() {
         assert_eq!(
             content_hash("abc"),
@@ -1953,7 +1974,8 @@ pub fn deep_explain_selection(
         );
 
         let request_key = format!("deep:{}", content_hash(&code));
-        let waiting = RequestWaiter::new(project.entity_id(), request_key.clone(), 0)?;
+        let waiting =
+            CodeExplanationRequestWaiter::new(project.entity_id(), request_key.clone(), 0)?;
         let permit = loop {
             if cancelled.load(Ordering::SeqCst) {
                 markdown.update(cx, |markdown, cx| markdown.replace("讲解已停止", cx));
@@ -3162,7 +3184,8 @@ async fn scan_project_file(
             break;
         }
         let request_key = format!("{cache_namespace}:{key}");
-        let waiting = RequestWaiter::new(project.entity_id(), request_key.clone(), 2)?;
+        let waiting =
+            CodeExplanationRequestWaiter::new(project.entity_id(), request_key.clone(), 2)?;
         let permit = loop {
             if cancelled.load(Ordering::SeqCst) {
                 result.skipped = true;

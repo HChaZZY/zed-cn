@@ -56,6 +56,52 @@ const REMOTE_SERVER_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 const REMOTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const CUSTOM_SERVER_DIGEST_TIMEOUT: Duration = Duration::from_secs(120);
 
+fn display_remote_command(program: &str, args: &[impl AsRef<str>]) -> String {
+    let mut display = program.to_owned();
+    for argument in args.iter().take(3) {
+        let argument = argument.as_ref();
+        let safe_argument = if argument.starts_with("http://")
+            || argument.starts_with("https://")
+            || argument.len() > 80
+            || argument.contains('\n')
+            || argument.contains("token")
+            || argument.contains("password")
+            || argument.contains("secret")
+        {
+            "…"
+        } else {
+            argument
+        };
+        display.push(' ');
+        display.push_str(safe_argument);
+    }
+    if args.len() > 3 {
+        display.push_str(" …");
+    }
+    display
+}
+
+fn connection_log_text(output: &str) -> String {
+    let text = output
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let first_token = text.split_whitespace().next().unwrap_or_default();
+    if first_token.len() == 64 && first_token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return "SHA-256 已返回".to_owned();
+    }
+    let mut text = text
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(120)
+        .collect::<String>();
+    if output.trim().chars().count() > 120 {
+        text.push('…');
+    }
+    text
+}
+
 fn verify_custom_server_digest(output: &str, expected: &str) -> Result<bool> {
     let output = output.trim();
     if output == "MISSING" {
@@ -67,6 +113,15 @@ fn verify_custom_server_digest(output: &str, expected: &str) -> Result<bool> {
         "已有 Zed CN 远程服务与对应发布产物不一致，已停止连接；请先关闭使用该服务的工作区再处理该文件"
     );
     Ok(true)
+}
+
+#[test]
+fn connection_log_summarizes_digest_without_exposing_it() {
+    let digest = "a".repeat(64);
+    assert_eq!(
+        connection_log_text(&format!("{digest}  .zed_server/server")),
+        "SHA-256 已返回"
+    );
 }
 
 #[test]
@@ -222,6 +277,7 @@ impl From<settings::SshConnection> for SshConnectionOptions {
 
 struct SshSocket {
     connection_options: SshConnectionOptions,
+    delegate: Arc<dyn RemoteClientDelegate>,
     #[cfg(not(windows))]
     socket_path: std::path::PathBuf,
     /// Extra environment variables needed for the ssh process
@@ -747,7 +803,7 @@ impl SshRemoteConnection {
         let (socket, master_process_option) = if let Some(reused_path) = reused_socket {
             delegate.set_status(Some("正在复用已有 SSH 连接"), cx);
             log::info!("reusing existing ControlMaster, skipping authentication");
-            let socket = SshSocket::new(connection_options, reused_path).await?;
+            let socket = SshSocket::new(connection_options, delegate.clone(), reused_path).await?;
             (socket, None)
         } else {
             let askpass_delegate = askpass::AskPassDelegate::new_with_cancellation(cx, {
@@ -807,7 +863,7 @@ impl SshRemoteConnection {
                 anyhow::bail!(error_message);
             }
 
-            let socket = SshSocket::new(connection_options, socket_path).await?;
+            let socket = SshSocket::new(connection_options, delegate.clone(), socket_path).await?;
             drop(askpass);
             (socket, Some(master_process))
         };
@@ -869,6 +925,7 @@ impl SshRemoteConnection {
 
             let socket = SshSocket::new(
                 connection_options,
+                delegate.clone(),
                 askpass
                     .get_password()
                     .or_else(|| askpass::EncryptedPassword::try_from("").ok())
@@ -973,6 +1030,7 @@ impl SshRemoteConnection {
 
         let display_version = custom_tag.as_deref().unwrap_or(&version_str);
         delegate.set_status(Some(&format!("正在检查远程开发服务 {display_version}")), cx);
+        delegate.append_connection_log("正在校验远程开发服务文件", cx);
         let binary_exists_on_server = if let Some(tag) = &custom_tag {
             self.verify_custom_server_binary(&dst_path, tag, delegate, cx)
                 .await?
@@ -1414,6 +1472,8 @@ impl SshRemoteConnection {
         };
         let args = kind.args_for_shell(false, script);
         let arguments: Vec<&str> = args.iter().map(String::as_str).collect();
+        delegate.set_status(Some("正在校验 Zed CN 远程开发服务完整性"), cx);
+        delegate.append_connection_log("正在计算远程服务 SHA-256", cx);
         let output = self
             .socket
             .run_command_with_timeout(
@@ -1824,9 +1884,14 @@ impl SshRemoteConnection {
 
 impl SshSocket {
     #[cfg(not(windows))]
-    async fn new(options: SshConnectionOptions, socket_path: PathBuf) -> Result<Self> {
+    async fn new(
+        options: SshConnectionOptions,
+        delegate: Arc<dyn RemoteClientDelegate>,
+        socket_path: PathBuf,
+    ) -> Result<Self> {
         Ok(Self {
             connection_options: options,
+            delegate,
             envs: HashMap::default(),
             socket_path,
         })
@@ -1835,6 +1900,7 @@ impl SshSocket {
     #[cfg(windows)]
     async fn new(
         options: SshConnectionOptions,
+        delegate: Arc<dyn RemoteClientDelegate>,
         password: askpass::EncryptedPassword,
         executor: gpui::BackgroundExecutor,
     ) -> Result<Self> {
@@ -1855,6 +1921,7 @@ impl SshSocket {
 
         Ok(Self {
             connection_options: options,
+            delegate,
             envs,
             _proxy,
         })
@@ -1915,20 +1982,68 @@ impl SshSocket {
         timeout: Duration,
         cx: &AsyncApp,
     ) -> Result<String> {
+        let display = display_remote_command(program, args);
+        self.delegate
+            .append_connection_log(&format!("$ {display}"), &mut cx.clone());
+
         let mut command = self.ssh_command(shell_kind, program, args, allow_pseudo_tty);
         command.kill_on_drop(true);
-        let output = command
+        let output = match command
             .output()
             .with_timeout(timeout, cx.background_executor())
             .await
-            .with_context(|| format!("remote command timed out after {timeout:?}"))??;
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                self.delegate.append_connection_log(
+                    &format!("✗ {display} — 无法启动：{error}"),
+                    &mut cx.clone(),
+                );
+                return Err(error.into());
+            }
+            Err(error) => {
+                self.delegate.append_connection_log(
+                    &format!("✗ {display} — 等待超过 {} 秒", timeout.as_secs()),
+                    &mut cx.clone(),
+                );
+                return Err(error)
+                    .with_context(|| format!("remote command timed out after {timeout:?}"));
+            }
+        };
         log::debug!("{:?}: {:?}", command, output);
-        anyhow::ensure!(
-            output.status.success(),
-            "failed to run command {command:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
+        if !output.status.success() {
+            let detail = connection_log_text(&String::from_utf8_lossy(&output.stderr));
+            self.delegate.append_connection_log(
+                &format!(
+                    "✗ {display} — {}",
+                    if detail.is_empty() {
+                        "命令失败"
+                    } else {
+                        &detail
+                    }
+                ),
+                &mut cx.clone(),
+            );
+            anyhow::bail!(
+                "failed to run command {command:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let detail = connection_log_text(&stdout);
+        self.delegate.append_connection_log(
+            &format!(
+                "✓ {display}{}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {detail}")
+                }
+            ),
+            &mut cx.clone(),
         );
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(stdout)
     }
 
     fn ssh_options<'a>(

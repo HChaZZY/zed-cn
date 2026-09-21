@@ -984,6 +984,30 @@ mod tests {
         );
         assert_eq!(humanize_action_name("editor::OpenUrl"), "编辑器: 打开 URL");
         assert_eq!(
+            humanize_action_name("markdown::OpenPreview"),
+            "Markdown: 打开预览"
+        );
+        assert_eq!(
+            humanize_action_name("tabular_data::OpenPreview"),
+            "表格数据: 打开预览"
+        );
+        assert_eq!(
+            humanize_action_name("copilot_edit_predictions::Reinstall"),
+            "Copilot 编辑预测: 重新安装"
+        );
+        assert_eq!(
+            humanize_action_name("dev::OpenEditPredictionContextView"),
+            "开发工具: 打开编辑预测上下文视图"
+        );
+        assert_eq!(
+            humanize_action_name("zed_predict_onboarding::OpenZedPredictOnboarding"),
+            "Zed Predict: 打开入门引导"
+        );
+        assert_eq!(
+            humanize_action_name("dev::UnlistedDiagnosticAction"),
+            "开发工具: unlisted diagnostic action"
+        );
+        assert_eq!(
             humanize_action_name("editor::ToggleGoToLine"),
             "编辑器: 转到行"
         );
