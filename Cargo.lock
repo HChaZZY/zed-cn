@@ -196,6 +196,7 @@ dependencies = [
  "proto",
  "remote",
  "smallvec",
+ "sysinfo 0.39.6",
  "ui",
  "util",
  "workspace",

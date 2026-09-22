@@ -42,14 +42,85 @@ use std::{
     num::NonZeroU64,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
+use sysinfo::{Disks, Networks, ProcessRefreshKind, RefreshKind, System, UpdateKind};
 use util::{ResultExt, paths::PathStyle, rel_path::RelPath};
 use worktree::Worktree;
+
+struct SystemStatsSampler {
+    system: System,
+    disks: Disks,
+    networks: Networks,
+    last_sample: Instant,
+}
+
+impl SystemStatsSampler {
+    fn new() -> Self {
+        let mut system = System::new();
+        system.refresh_cpu_all();
+        system.refresh_memory();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        Self {
+            system,
+            disks: Disks::new_with_refreshed_list(),
+            networks: Networks::new_with_refreshed_list(),
+            last_sample: Instant::now(),
+        }
+    }
+
+    fn sample(&mut self) -> proto::GetSystemStatsResponse {
+        let elapsed = self.last_sample.elapsed().as_secs_f64().max(0.001);
+        self.system.refresh_cpu_usage();
+        self.system.refresh_memory();
+        self.system
+            .refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        self.disks.refresh(true);
+        self.networks.refresh(true);
+        self.last_sample = Instant::now();
+
+        let disk_total_bytes: u64 = self.disks.iter().map(|disk| disk.total_space()).sum();
+        let disk_available_bytes: u64 = self.disks.iter().map(|disk| disk.available_space()).sum();
+        let received: u64 = self.networks.values().map(|data| data.received()).sum();
+        let transmitted: u64 = self.networks.values().map(|data| data.transmitted()).sum();
+        let load = System::load_average();
+
+        proto::GetSystemStatsResponse {
+            hostname: System::host_name().unwrap_or_else(|| "未知主机".into()),
+            os_name: System::long_os_version()
+                .or_else(System::name)
+                .unwrap_or_else(|| "未知系统".into()),
+            kernel_version: System::kernel_version().unwrap_or_default(),
+            uptime_seconds: System::uptime(),
+            cpu_usage_percent: self.system.global_cpu_usage(),
+            cpu_core_usage_percent: self
+                .system
+                .cpus()
+                .iter()
+                .map(|cpu| cpu.cpu_usage())
+                .collect(),
+            memory_used_bytes: self.system.used_memory(),
+            memory_total_bytes: self.system.total_memory(),
+            swap_used_bytes: self.system.used_swap(),
+            swap_total_bytes: self.system.total_swap(),
+            disk_used_bytes: disk_total_bytes.saturating_sub(disk_available_bytes),
+            disk_total_bytes,
+            network_received_bytes_per_second: (received as f64 / elapsed) as u64,
+            network_transmitted_bytes_per_second: (transmitted as f64 / elapsed) as u64,
+            process_count: self.system.processes().len().try_into().unwrap_or(u32::MAX),
+            load_average_one: load.one,
+            load_average_five: load.five,
+            load_average_fifteen: load.fifteen,
+            sampled_at_unix_seconds: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs().try_into().unwrap_or(i64::MAX))
+                .unwrap_or_default(),
+        }
+    }
+}
 
 pub struct HeadlessProject {
     pub fs: Arc<dyn Fs>,
@@ -326,6 +397,7 @@ impl HeadlessProject {
         session.add_request_handler(cx.weak_entity(), Self::handle_get_processes);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_remote_profiling_data);
         session.add_request_handler(cx.weak_entity(), Self::handle_create_temporary_file);
+        session.add_request_handler(cx.weak_entity(), Self::handle_get_system_stats);
 
         session.add_entity_request_handler(Self::handle_add_worktree);
         session.add_request_handler(cx.weak_entity(), Self::handle_remove_worktree);
@@ -896,6 +968,22 @@ impl HeadlessProject {
             file_id
         );
         Ok(proto::DownloadFileResponse { file_id })
+    }
+
+    async fn handle_get_system_stats(
+        _this: Entity<Self>,
+        _message: TypedEnvelope<proto::GetSystemStats>,
+        cx: AsyncApp,
+    ) -> Result<proto::GetSystemStatsResponse> {
+        cx.background_spawn(async move {
+            static SAMPLER: OnceLock<Mutex<SystemStatsSampler>> = OnceLock::new();
+            let sampler = SAMPLER.get_or_init(|| Mutex::new(SystemStatsSampler::new()));
+            let mut sampler = sampler
+                .lock()
+                .map_err(|_| anyhow!("system statistics sampler is unavailable"))?;
+            Ok(sampler.sample())
+        })
+        .await
     }
 
     async fn handle_create_temporary_file(

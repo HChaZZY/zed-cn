@@ -162,6 +162,7 @@ pub enum IconName {
     GenericMaximize,
     GenericMinimize,
     GenericRestore,
+    Gauge,
     Gerrit,
     GitBranch,
     GitBranchPlus,

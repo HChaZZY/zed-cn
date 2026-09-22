@@ -606,6 +606,19 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let activity_indicator = activity_indicator::ActivityIndicator::new(workspace, window, cx);
         let file_transfer_indicator =
             activity_indicator::file_transfer::FileTransferIndicator::new(workspace, cx);
+        let system_monitor = activity_indicator::system_monitor::SystemMonitor::new(workspace, cx);
+        workspace.register_action(
+            |workspace, _: &activity_indicator::system_monitor::ToggleFocus, window, cx| {
+                workspace
+                    .toggle_panel_focus::<activity_indicator::system_monitor::SystemMonitorPanel>(
+                        window, cx,
+                    );
+            },
+        );
+        let system_monitor_panel = cx.new(|cx| {
+            activity_indicator::system_monitor::SystemMonitorPanel::new(system_monitor.clone(), cx)
+        });
+        workspace.add_panel(system_monitor_panel, window, cx);
         let active_buffer_encoding =
             cx.new(|_| encoding_selector::ActiveBufferEncoding::new(workspace));
         let active_buffer_language =
@@ -648,6 +661,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                 editor::code_explanations::CodeExplanationIndicator::default()
             });
             status_bar.add_right_item(explanations, window, cx);
+            status_bar.add_right_item(system_monitor, window, cx);
             status_bar.add_right_item(edit_prediction_ui, window, cx);
             status_bar.add_right_item(active_buffer_encoding, window, cx);
             status_bar.add_right_item(active_buffer_language, window, cx);

@@ -524,7 +524,9 @@ message Envelope {
     ExecuteLspCommandResponse execute_lsp_command_response = 492;
     RefreshDocumentHighlights refresh_document_highlights = 493;
     CreateTemporaryFile create_temporary_file = 494;
-    CreateTemporaryFileResponse create_temporary_file_response = 495; // current max
+    CreateTemporaryFileResponse create_temporary_file_response = 495;
+    GetSystemStats get_system_stats = 496;
+    GetSystemStatsResponse get_system_stats_response = 497; // current max
   }
 
   reserved 87 to 88;

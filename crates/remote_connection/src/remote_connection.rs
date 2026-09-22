@@ -287,7 +287,7 @@ impl Render for RemoteConnectionPrompt {
                                 v_flex()
                                     .mt_1()
                                     .w_full()
-                                    .h(rems(10.5))
+                                    .h(rems(14.))
                                     .overflow_hidden()
                                     .rounded_sm()
                                     .border_1()
@@ -325,7 +325,10 @@ impl Render for RemoteConnectionPrompt {
                                             .children(self.connection_log.iter().cloned().map(
                                                 |line| {
                                                     div()
+                                                        .flex_none()
                                                         .w_full()
+                                                        .h(rems(1.))
+                                                        .line_height(rems(1.))
                                                         .overflow_hidden()
                                                         .text_ellipsis()
                                                         .whitespace_nowrap()

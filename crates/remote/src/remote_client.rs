@@ -169,6 +169,7 @@ pub trait RemoteClientDelegate: Send + Sync {
 }
 
 pub const TEMPORARY_FILES_CAPABILITY: &str = "temporary_files_v1";
+pub const SYSTEM_STATS_CAPABILITY: &str = "system_stats_v1";
 
 const MAX_MISSED_HEARTBEATS: usize = 5;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -1264,6 +1265,16 @@ impl RemoteClient {
 
     pub fn supports_temporary_files(&self) -> bool {
         self.client.supports_temporary_files.load(SeqCst)
+    }
+
+    pub fn supports_system_stats(&self) -> bool {
+        self.client.supports_system_stats.load(SeqCst)
+    }
+
+    pub fn system_stats(
+        &self,
+    ) -> impl Future<Output = Result<proto::GetSystemStatsResponse>> + use<> {
+        self.proto_client().request(proto::GetSystemStats {})
     }
 
     pub fn connection_options(&self) -> RemoteConnectionOptions {
@@ -2529,6 +2540,7 @@ pub(crate) struct ChannelClient {
     task: Mutex<Task<Result<()>>>,
     remote_started: Signal<()>,
     supports_temporary_files: AtomicBool,
+    supports_system_stats: AtomicBool,
     session_invalidated: Arc<Signal<String>>,
     session_is_invalid: Arc<AtomicBool>,
     has_wsl_interop: bool,
@@ -2561,6 +2573,7 @@ impl ChannelClient {
             )),
             remote_started: Signal::new(cx),
             supports_temporary_files: AtomicBool::new(false),
+            supports_system_stats: AtomicBool::new(false),
             session_invalidated: Arc::new(Signal::new(cx)),
             session_is_invalid: Arc::new(AtomicBool::new(false)),
             has_wsl_interop,
@@ -2579,7 +2592,10 @@ impl ChannelClient {
         cx.spawn(async move |cx| {
             if let Some(this) = this.upgrade() {
                 let envelope = proto::RemoteStarted {
-                    capabilities: vec![TEMPORARY_FILES_CAPABILITY.to_string()],
+                    capabilities: vec![
+                        TEMPORARY_FILES_CAPABILITY.to_string(),
+                        SYSTEM_STATS_CAPABILITY.to_string(),
+                    ],
                 }
                 .into_envelope(0, None, None);
                 this.outgoing_tx.lock().unbounded_send(envelope).ok();
@@ -2623,6 +2639,13 @@ impl ChannelClient {
                             .capabilities
                             .iter()
                             .any(|capability| capability == TEMPORARY_FILES_CAPABILITY),
+                        SeqCst,
+                    );
+                    this.supports_system_stats.store(
+                        started
+                            .capabilities
+                            .iter()
+                            .any(|capability| capability == SYSTEM_STATS_CAPABILITY),
                         SeqCst,
                     );
                     this.remote_started.set(());
