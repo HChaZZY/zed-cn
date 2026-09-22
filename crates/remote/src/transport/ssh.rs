@@ -788,6 +788,8 @@ impl SshRemoteConnection {
         use askpass::AskPassResult;
 
         let destination = connection_options.ssh_destination();
+        let mut connection_options = connection_options;
+        let managed_key = crate::managed_ssh_keys::apply_managed_identity(&mut connection_options)?;
 
         let temp_dir = tempfile::Builder::new()
             .prefix("zed-ssh-session")
@@ -954,6 +956,15 @@ impl SshRemoteConnection {
         delegate.set_status(Some("正在检测远程系统版本"), cx);
         let ssh_os_version = socket.os_version(ssh_platform.os, ssh_shell_kind, cx).await;
         log::info!("Remote OS version discovered: {:?}", ssh_os_version);
+
+        if let Some(managed_key) = managed_key {
+            crate::managed_ssh_keys::mark_managed_ssh_key_used(&managed_key.key_id)?;
+        } else if delegate.should_create_managed_ssh_key() {
+            delegate.set_status(Some("正在创建并部署 Zed 专属 SSH 密钥"), cx);
+            socket
+                .create_and_deploy_managed_key(ssh_shell_kind, ssh_platform.os, cx)
+                .await?;
+        }
 
         let (ssh_path_style, ssh_default_system_shell) = match ssh_platform.os {
             RemoteOs::Windows => (PathStyle::Windows, ssh_shell.clone()),
@@ -1925,6 +1936,89 @@ impl SshSocket {
             envs,
             _proxy,
         })
+    }
+
+    async fn create_and_deploy_managed_key(
+        &self,
+        shell_kind: ShellKind,
+        remote_os: RemoteOs,
+        cx: &AsyncApp,
+    ) -> Result<()> {
+        if remote_os == RemoteOs::Windows {
+            anyhow::bail!("Zed 专属 SSH 密钥暂不支持自动部署到 Windows 远程主机");
+        }
+
+        let remote_username = self
+            .run_command_with_timeout(
+                shell_kind,
+                "id",
+                &["-un"],
+                false,
+                REMOTE_COMMAND_TIMEOUT,
+                cx,
+            )
+            .await?
+            .trim()
+            .to_string();
+        if remote_username.is_empty() {
+            anyhow::bail!("远程主机没有返回当前 SSH 用户名");
+        }
+
+        let generated = crate::managed_ssh_keys::generate_managed_ssh_key(
+            &self.connection_options,
+            remote_username,
+        )
+        .await?;
+        let install_script = "umask 077; mkdir -p \"$HOME/.ssh\"; file=\"$HOME/.ssh/authorized_keys\"; lock=\"$HOME/.ssh/.zed-authorized-keys.lock\"; count=0; while ! mkdir \"$lock\" 2>/dev/null; do count=$((count+1)); [ \"$count\" -ge 100 ] && exit 73; sleep 0.1; done; trap 'rmdir \"$lock\"' EXIT HUP INT TERM; touch \"$file\"; chmod 700 \"$HOME/.ssh\"; chmod 600 \"$file\"; key=$1; set -- $key; type=$1; blob=$2; if ! awk -v type=\"$type\" -v blob=\"$blob\" '$1 == type && $2 == blob { found=1 } END { exit !found }' \"$file\"; then printf '%s\\n' \"$key\" >> \"$file\"; fi";
+        self.run_command_with_timeout(
+            shell_kind,
+            "sh",
+            &[
+                "-c",
+                install_script,
+                "zed-install-key",
+                &generated.record.public_key,
+            ],
+            false,
+            REMOTE_COMMAND_TIMEOUT,
+            cx,
+        )
+        .await
+        .context("将 Zed SSH 公钥部署到远程 authorized_keys 失败")?;
+
+        self.verify_managed_key(&generated.private_key_path, cx)
+            .await
+            .context("公钥已写入远程主机，但使用新密钥进行独立验证失败")?;
+        crate::managed_ssh_keys::mark_managed_ssh_key_verified(&generated.record.key_id)?;
+        self.delegate
+            .append_connection_log("✓ Zed 专属 SSH 密钥已部署并验证", &mut cx.clone());
+        Ok(())
+    }
+
+    async fn verify_managed_key(&self, private_key_path: &Path, cx: &AsyncApp) -> Result<()> {
+        let mut command = util::command::new_command("ssh");
+        command
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .args(
+                self.connection_options
+                    .additional_args_without_port_forwards(),
+            )
+            .args(["-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-i"])
+            .arg(private_key_path)
+            .arg(self.connection_options.ssh_destination())
+            .arg("true");
+        let output = command
+            .output()
+            .with_timeout(REMOTE_COMMAND_TIMEOUT, cx.background_executor())
+            .await
+            .context("验证 Zed SSH 密钥超时")??;
+        if !output.status.success() {
+            anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+        }
+        Ok(())
     }
 
     // :WARNING: ssh unquotes arguments when executing on the remote :WARNING:

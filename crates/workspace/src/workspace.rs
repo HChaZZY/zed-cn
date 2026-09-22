@@ -6623,7 +6623,16 @@ impl Workspace {
             project.set_active_path(active_entry.clone(), cx)
         });
 
-        if focus_changed && let Some(project_path) = &active_entry {
+        // Infer the active repository only from singleton items.
+        // A multibuffer's active path represents the cursor's location within
+        // an aggregate view, so we assume it's not the user's intent to switch
+        // repositories.
+        if focus_changed
+            && let Some(project_path) = &active_entry
+            && self
+                .active_item(cx)
+                .is_some_and(|item| item.buffer_kind(cx) == ItemBufferKind::Singleton)
+        {
             let git_store_entity = self.project.read(cx).git_store().clone();
             git_store_entity.update(cx, |git_store, cx| {
                 git_store.set_active_repo_for_path(project_path, cx);
@@ -10759,6 +10768,61 @@ pub fn activate_any_workspace_window(cx: &mut AsyncApp) -> Option<WindowHandle<M
     })
 }
 
+fn same_workspace_host(left: &RemoteConnectionOptions, right: &RemoteConnectionOptions) -> bool {
+    match (left, right) {
+        (RemoteConnectionOptions::Ssh(a), RemoteConnectionOptions::Ssh(b)) => {
+            (&a.host, &a.username, &a.port) == (&b.host, &b.username, &b.port)
+        }
+        (RemoteConnectionOptions::Wsl(a), RemoteConnectionOptions::Wsl(b)) => {
+            // The WSL username is not consistently populated in the workspace location, so ignore it for now.
+            a.distro_name == b.distro_name
+        }
+        (RemoteConnectionOptions::Docker(a), RemoteConnectionOptions::Docker(b)) => {
+            a.container_id == b.container_id
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        (RemoteConnectionOptions::Mock(a), RemoteConnectionOptions::Mock(b)) => a.id == b.id,
+        _ => false,
+    }
+}
+
+fn workspace_matches_location(
+    workspace: &Entity<Workspace>,
+    serialized_location: &SerializedWorkspaceLocation,
+    cx: &App,
+) -> bool {
+    match (
+        workspace.read(cx).workspace_location(cx),
+        serialized_location,
+    ) {
+        (
+            WorkspaceLocation::Location(SerializedWorkspaceLocation::Local, _),
+            SerializedWorkspaceLocation::Local,
+        ) => true,
+        (
+            WorkspaceLocation::Location(SerializedWorkspaceLocation::Remote(left), _),
+            SerializedWorkspaceLocation::Remote(right),
+        ) => same_workspace_host(&left, right),
+        _ => false,
+    }
+}
+
+fn workspace_for_location(
+    multi_workspace: &MultiWorkspace,
+    serialized_location: &SerializedWorkspaceLocation,
+    cx: &App,
+) -> Option<Entity<Workspace>> {
+    let active_workspace = multi_workspace.workspace();
+    if workspace_matches_location(active_workspace, serialized_location, cx) {
+        return Some(active_workspace.clone());
+    }
+
+    multi_workspace
+        .workspaces()
+        .find(|workspace| workspace_matches_location(workspace, serialized_location, cx))
+        .cloned()
+}
+
 pub fn workspace_windows_for_location(
     serialized_location: &SerializedWorkspaceLocation,
     cx: &App,
@@ -10767,43 +10831,8 @@ pub fn workspace_windows_for_location(
         .into_iter()
         .filter_map(|window| window.downcast::<MultiWorkspace>())
         .filter(|multi_workspace| {
-            let same_host = |left: &RemoteConnectionOptions, right: &RemoteConnectionOptions| match (left, right) {
-                (RemoteConnectionOptions::Ssh(a), RemoteConnectionOptions::Ssh(b)) => {
-                    (&a.host, &a.username, &a.port) == (&b.host, &b.username, &b.port)
-                }
-                (RemoteConnectionOptions::Wsl(a), RemoteConnectionOptions::Wsl(b)) => {
-                    // The WSL username is not consistently populated in the workspace location, so ignore it for now.
-                    a.distro_name == b.distro_name
-                }
-                (RemoteConnectionOptions::Docker(a), RemoteConnectionOptions::Docker(b)) => {
-                    a.container_id == b.container_id
-                }
-                #[cfg(any(test, feature = "test-support"))]
-                (RemoteConnectionOptions::Mock(a), RemoteConnectionOptions::Mock(b)) => {
-                    a.id == b.id
-                }
-                _ => false,
-            };
-
             multi_workspace.read(cx).is_ok_and(|multi_workspace| {
-                multi_workspace.workspaces().any(|workspace| {
-                    match workspace.read(cx).workspace_location(cx) {
-                        WorkspaceLocation::Location(location, _) => {
-                            match (&location, serialized_location) {
-                                (
-                                    SerializedWorkspaceLocation::Local,
-                                    SerializedWorkspaceLocation::Local,
-                                ) => true,
-                                (
-                                    SerializedWorkspaceLocation::Remote(a),
-                                    SerializedWorkspaceLocation::Remote(b),
-                                ) => same_host(a, b),
-                                _ => false,
-                            }
-                        }
-                        _ => false,
-                    }
-                })
+                workspace_for_location(multi_workspace, serialized_location, cx).is_some()
             })
         })
         .collect()
@@ -10884,12 +10913,12 @@ pub async fn find_existing_workspace(
                     .and_then(|window| window.downcast::<MultiWorkspace>())
                     .filter(|window| windows.contains(window))
                     .or_else(|| windows.into_iter().next());
-                if let Some(window) = window {
-                    if let Ok(multi_workspace) = window.read(cx) {
-                        let active_workspace = multi_workspace.workspace().clone();
-                        existing = Some((window, active_workspace));
-                        open_visible = OpenVisible::None;
-                    }
+                if let Some(window) = window
+                    && let Ok(multi_workspace) = window.read(cx)
+                    && let Some(workspace) = workspace_for_location(multi_workspace, location, cx)
+                {
+                    existing = Some((window, workspace));
+                    open_visible = OpenVisible::None;
                 }
             });
         }
@@ -11123,12 +11152,16 @@ pub fn open_paths(
                         .and_then(|window| window.downcast::<MultiWorkspace>())
                         .filter(|window| windows.contains(window))
                         .or_else(|| windows.into_iter().next());
-                    if let Some(window) = window {
-                        if let Ok(multi_workspace) = window.read(cx) {
-                            let active_workspace = multi_workspace.workspace().clone();
-                            existing = Some((window, active_workspace));
-                            open_visible = OpenVisible::None;
-                        }
+                    if let Some(window) = window
+                        && let Ok(multi_workspace) = window.read(cx)
+                        && let Some(workspace) = workspace_for_location(
+                            multi_workspace,
+                            &SerializedWorkspaceLocation::Local,
+                            cx,
+                        )
+                    {
+                        existing = Some((window, workspace));
+                        open_visible = OpenVisible::None;
                     }
                 });
             }
@@ -11169,7 +11202,7 @@ pub fn open_paths(
                     open_options.requesting_window = Some(window);
                     window
                         .update(cx, |multi_workspace, _, cx| {
-                            if AgentSettings::get_global(cx).threads_sidebar_auto_open {
+                            if AgentSettings::get_global(cx).threads_sidebar.auto_open {
                                 multi_workspace.open_sidebar(cx);
                             } else {
                                 // Opening the sidebar is also what pins the

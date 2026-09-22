@@ -166,6 +166,9 @@ pub trait RemoteClientDelegate: Send + Sync {
     fn set_status(&self, status: Option<&str>, cx: &mut AsyncApp);
     fn append_connection_log(&self, _line: &str, _cx: &mut AsyncApp) {}
     fn set_transfer_progress(&self, _progress: Option<f32>, _cx: &mut AsyncApp) {}
+    fn should_create_managed_ssh_key(&self) -> bool {
+        false
+    }
 }
 
 pub const TEMPORARY_FILES_CAPABILITY: &str = "temporary_files_v1";

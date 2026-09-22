@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
-use std::ops::Range;
+use std::{collections::HashSet, ops::Range};
 
 pub const MAX_INPUT_BYTES: usize = 20 * 1024;
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -38,56 +38,56 @@ pub fn fit_units_to_budget(
         if available == 0 {
             continue;
         }
-        let mut start = unit.range.start;
-        let mut first_row = unit.first_row;
-        let mut bytes = 0usize;
-        let mut rows = 0usize;
+        let mut segment_start = unit.range.start;
+        let mut segment_first_row = unit.first_row;
+        let mut segment_bytes = 0usize;
+        let mut segment_rows = 0usize;
+        let mut segment_tokens = 0u64;
         for line in code.split_inclusive('\n') {
-            let segment_offset = start.saturating_sub(unit.range.start);
-            if bytes > 0
-                && estimate_tokens(&code[segment_offset..segment_offset + bytes + line.len()])
-                    .saturating_add(((rows + 1) * 12) as u64)
-                    > available as u64
-            {
+            let line_tokens = estimate_tokens(line).saturating_add(12);
+            if segment_bytes > 0 && segment_tokens.saturating_add(line_tokens) > available as u64 {
                 let mut part = unit.clone();
-                part.range = start..start + bytes;
-                part.first_row = first_row;
-                part.last_row = first_row + rows.saturating_sub(1);
+                part.range = segment_start..segment_start + segment_bytes;
+                part.first_row = segment_first_row;
+                part.last_row = segment_first_row + segment_rows.saturating_sub(1);
                 part.commented_rows = unit
                     .commented_rows
                     .iter()
                     .filter_map(|row| {
                         let absolute = unit.first_row + row;
-                        (absolute >= first_row && absolute < first_row + rows)
-                            .then(|| absolute - first_row)
+                        (absolute >= segment_first_row
+                            && absolute < segment_first_row + segment_rows)
+                            .then(|| absolute - segment_first_row)
                     })
                     .collect();
                 result.push(part);
-                start += bytes;
-                first_row += rows;
-                bytes = 0;
-                rows = 0;
+                segment_start += segment_bytes;
+                segment_first_row += segment_rows;
+                segment_bytes = 0;
+                segment_rows = 0;
+                segment_tokens = 0;
             }
-            if estimate_tokens(line).saturating_add(12) > available as u64 {
-                start += line.len();
-                first_row += 1;
+            if line_tokens > available as u64 {
+                segment_start += line.len();
+                segment_first_row += 1;
                 continue;
             }
-            bytes += line.len();
-            rows += 1;
+            segment_bytes += line.len();
+            segment_rows += 1;
+            segment_tokens = segment_tokens.saturating_add(line_tokens);
         }
-        if bytes > 0 {
+        if segment_bytes > 0 {
             let mut part = unit.clone();
-            part.range = start..start + bytes;
-            part.first_row = first_row;
-            part.last_row = first_row + rows.saturating_sub(1);
+            part.range = segment_start..segment_start + segment_bytes;
+            part.first_row = segment_first_row;
+            part.last_row = segment_first_row + segment_rows.saturating_sub(1);
             part.commented_rows = unit
                 .commented_rows
                 .iter()
                 .filter_map(|row| {
                     let absolute = unit.first_row + row;
-                    (absolute >= first_row && absolute < first_row + rows)
-                        .then(|| absolute - first_row)
+                    (absolute >= segment_first_row && absolute < segment_first_row + segment_rows)
+                        .then(|| absolute - segment_first_row)
                 })
                 .collect();
             result.push(part);
@@ -166,6 +166,7 @@ pub fn file_units(snapshot: &language::BufferSnapshot, maximum_lines: u64) -> Ve
         return vec![unit];
     }
     let mut units = Vec::new();
+    let mut seen_ranges = HashSet::new();
     let mut row = 0;
     while row <= snapshot.max_point().row {
         let candidates = units_at(snapshot, row);
@@ -175,11 +176,7 @@ pub fn file_units(snapshot: &language::BufferSnapshot, maximum_lines: u64) -> Ve
             .max()
             .unwrap_or(row as usize + 1);
         for unit in candidates {
-            if !unit.range.is_empty()
-                && !units
-                    .iter()
-                    .any(|existing: &Unit| existing.range == unit.range)
-            {
+            if !unit.range.is_empty() && seen_ranges.insert((unit.range.start, unit.range.end)) {
                 units.push(unit);
             }
         }
@@ -259,7 +256,12 @@ pub fn units_at(snapshot: &language::BufferSnapshot, row: u32) -> Vec<Unit> {
             commented_rows.push(0);
         }
         let mut descendants = vec![node];
+        let mut descendant_visits = 0usize;
         while let Some(child) = descendants.pop() {
+            descendant_visits += 1;
+            if descendant_visits > 4096 {
+                break;
+            }
             if child.kind().contains("comment") {
                 if let Some(next) = child.next_named_sibling() {
                     if child.end_position().row + 1 >= next.start_position().row {
@@ -269,9 +271,6 @@ pub fn units_at(snapshot: &language::BufferSnapshot, row: u32) -> Vec<Unit> {
             } else {
                 let mut cursor = child.walk();
                 descendants.extend(child.named_children(&mut cursor));
-            }
-            if descendants.len() > 4096 {
-                break;
             }
         }
         result.push(Unit {
@@ -494,6 +493,40 @@ mod tests {
         }
         assert_eq!(request_code_budget(2048), 0);
         assert_eq!(request_code_budget(8192), 4096);
+    }
+
+    #[gpui::test]
+    fn model_budget_skips_an_oversized_unicode_line_without_corrupting_ranges(cx: &mut gpui::App) {
+        let code = format!("first();\n{}\nlast();\n", "中文".repeat(100));
+        let snapshot = language::Buffer::build_snapshot_sync(
+            code.into(),
+            Some(language::rust_lang()),
+            None,
+            cx,
+        );
+        let unit = Unit {
+            range: 0..snapshot.len(),
+            owner: 0..snapshot.len(),
+            owner_lines: 3,
+            first_row: 0,
+            last_row: 2,
+            context: String::new(),
+            commented_rows: Vec::new(),
+        };
+
+        let parts = fit_units_to_budget(&snapshot, vec![unit], 320, |text| text.len() as u64);
+        let texts = parts
+            .iter()
+            .map(|part| {
+                snapshot
+                    .text_for_range(part.range.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(texts, ["first();\n", "last();\n"]);
+        assert_eq!(parts[0].first_row, 0);
+        assert_eq!(parts[1].first_row, 2);
     }
 
     #[test]

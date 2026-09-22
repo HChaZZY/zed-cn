@@ -793,6 +793,16 @@ impl AutoUpdater {
             matches!(os, "linux" | "macos" | "windows") && matches!(arch, "x86_64" | "aarch64"),
             "不支持的远程服务平台"
         );
+        let extension = if os == "windows" { "zip" } else { "gz" };
+        let directory = paths::remote_servers_dir()
+            .join("zed-cn")
+            .join(format!("{os}-{arch}"));
+        let path = directory.join(format!("{tag}.{extension}"));
+        if let Some(path) = cached_custom_remote_server(path.clone()).await? {
+            set_status("正在使用本地缓存的 Zed CN 远程服务", cx);
+            return Ok(path);
+        }
+
         let client = this.read_with(cx, |this, _| this.client.http_client());
         let executor = cx.background_executor().clone();
         let base_url = format!("https://github.com/rxp200/zed-cn/releases/download/{tag}");
@@ -804,21 +814,12 @@ impl AutoUpdater {
         )
         .await?;
         validate_custom_remote_server_metadata(&metadata, &tag, &source_sha)?;
-        let extension = if os == "windows" { "zip" } else { "gz" };
         let name = format!("zed-remote-server-{os}-{arch}.{extension}");
         let checksums =
             read_remote_release_metadata(&client, &format!("{base_url}/SHA256SUMS.txt"), &executor)
                 .await?;
         let checksum = remote_server_checksum(std::str::from_utf8(&checksums)?, &name)?;
-        let directory = paths::remote_servers_dir()
-            .join("zed-cn")
-            .join(format!("{os}-{arch}"));
         smol::fs::create_dir_all(&directory).await?;
-        let path = directory.join(format!("{tag}.{extension}"));
-        if smol::fs::metadata(&path).await.is_ok() {
-            verify_update_checksum(&path, &checksum).await?;
-            return Ok(path);
-        }
         // Validate a staging file before publishing it to the shared download cache.
         let staging = tempfile::Builder::new()
             .tempfile_in(&directory)?
@@ -1370,6 +1371,21 @@ async fn download_remote_server_binary(
     smol::fs::rename(&temp, &target_path).await?;
 
     Ok(())
+}
+
+async fn cached_custom_remote_server(path: PathBuf) -> Result<Option<PathBuf>> {
+    match smol::fs::metadata(&path).await {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_file() && metadata.len() > 0,
+                "Zed CN 远程服务缓存不是非空普通文件：{}",
+                path.display()
+            );
+            Ok(Some(path))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("无法检查 Zed CN 远程服务本地缓存"),
+    }
 }
 
 fn validate_custom_remote_server_metadata(body: &[u8], tag: &str, source_sha: &str) -> Result<()> {
@@ -2171,6 +2187,41 @@ mod tests {
         ) -> Poll<std::io::Result<usize>> {
             Poll::Pending
         }
+    }
+
+    #[gpui::test]
+    async fn test_custom_remote_server_cache_short_circuits_lookup(cx: &mut TestAppContext) {
+        cx.background_executor.allow_parking();
+        let directory = tempdir().expect("directory");
+        let cached = directory.path().join("zed-cn-v1.19.2-r1.gz");
+        smol::fs::write(&cached, b"cached archive")
+            .await
+            .expect("write cache");
+
+        assert_eq!(
+            cached_custom_remote_server(cached.clone())
+                .await
+                .expect("inspect cache"),
+            Some(cached)
+        );
+        assert_eq!(
+            cached_custom_remote_server(directory.path().join("missing.gz"))
+                .await
+                .expect("inspect missing cache"),
+            None
+        );
+
+        let empty = directory.path().join("empty.gz");
+        smol::fs::write(&empty, &[])
+            .await
+            .expect("write empty cache");
+        assert!(cached_custom_remote_server(empty).await.is_err());
+
+        let not_a_file = directory.path().join("directory.gz");
+        smol::fs::create_dir(&not_a_file)
+            .await
+            .expect("create directory");
+        assert!(cached_custom_remote_server(not_a_file).await.is_err());
     }
 
     #[gpui::test]

@@ -1,4 +1,11 @@
-use std::{collections::VecDeque, path::PathBuf, sync::Arc};
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use anyhow::Result;
 use askpass::EncryptedPassword;
@@ -15,8 +22,8 @@ use semver::Version;
 use settings::Settings;
 use theme_settings::ThemeSettings;
 use ui::{
-    ActiveTheme, CommonAnimationExt, Context, InteractiveElement, KeyBinding, ListItem,
-    ProgressBar, Tooltip, prelude::*,
+    ActiveTheme, Checkbox, CommonAnimationExt, Context, InteractiveElement, KeyBinding, ListItem,
+    ProgressBar, ToggleState, Tooltip, prelude::*,
 };
 use ui_input::{ERASED_EDITOR_FACTORY, ErasedEditor};
 use workspace::{DismissDecision, ModalView, Workspace};
@@ -34,7 +41,17 @@ pub struct RemoteConnectionPrompt {
     cancellation: Option<oneshot::Sender<()>>,
     editor: Arc<dyn ErasedEditor>,
     is_password_prompt: bool,
+    offer_managed_key_creation: bool,
+    create_managed_key: Arc<AtomicBool>,
     is_masked: bool,
+}
+
+fn is_account_password_prompt(prompt: &str) -> bool {
+    let prompt = prompt.trim().to_ascii_lowercase();
+    prompt.contains("password")
+        && !prompt.contains("passphrase")
+        && !prompt.contains("private key")
+        && !prompt.contains("密钥口令")
 }
 
 impl Drop for RemoteConnectionPrompt {
@@ -79,6 +96,8 @@ impl RemoteConnectionPrompt {
             prompt: None,
             prompt_cancellation_task: None,
             is_password_prompt: false,
+            offer_managed_key_creation: false,
+            create_managed_key: Arc::new(AtomicBool::new(false)),
             is_masked: true,
         }
     }
@@ -97,6 +116,7 @@ impl RemoteConnectionPrompt {
     ) {
         let is_yes_no = prompt.contains("yes/no");
         self.is_password_prompt = !is_yes_no;
+        self.offer_managed_key_creation = is_account_password_prompt(&prompt);
         self.is_masked = !is_yes_no;
         self.editor.set_masked(self.is_masked, window, cx);
 
@@ -183,6 +203,7 @@ impl Render for RemoteConnectionPrompt {
         };
 
         let is_password_prompt = self.is_password_prompt;
+        let offer_managed_key_creation = self.offer_managed_key_creation;
         let is_masked = self.is_masked;
         let (masked_password_icon, masked_password_tooltip) = if is_masked {
             (IconName::Eye, "Toggle to Unmask Password")
@@ -219,7 +240,38 @@ impl Render for RemoteConnectionPrompt {
                                     )
                                 }),
                         )
-                        .child(div().flex_1().child(self.editor.render(window, cx))),
+                        .child(div().flex_1().child(self.editor.render(window, cx)))
+                        .when(offer_managed_key_creation, |this| {
+                            let create_managed_key =
+                                self.create_managed_key.load(Ordering::Relaxed);
+                            this.child(
+                                v_flex()
+                                    .mt_2()
+                                    .gap_1()
+                                    .child(
+                                        Checkbox::new(
+                                            "create-zed-managed-ssh-key",
+                                            ToggleState::from(create_managed_key),
+                                        )
+                                        .label("创建此主机的 Zed 专属 SSH 密钥")
+                                        .on_click(cx.listener(
+                                            |this, state: &ToggleState, _, cx| {
+                                                this.create_managed_key
+                                                    .store(state.selected(), Ordering::Relaxed);
+                                                cx.notify();
+                                                cx.stop_propagation();
+                                            },
+                                        )),
+                                    )
+                                    .child(
+                                        Label::new(
+                                            "连接成功后会自动部署并验证独立密钥，以后无需再次输入密码。",
+                                        )
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                    ),
+                            )
+                        }),
                 )
                 .when(window.capslock().on, |this| {
                     this.child(
@@ -551,6 +603,7 @@ pub struct RemoteClientDelegate {
     window: AnyWindowHandle,
     ui: WeakEntity<RemoteConnectionPrompt>,
     known_password: Option<EncryptedPassword>,
+    create_managed_key: Arc<AtomicBool>,
 }
 
 impl RemoteClientDelegate {
@@ -563,6 +616,7 @@ impl RemoteClientDelegate {
             window,
             ui,
             known_password,
+            create_managed_key: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -629,6 +683,10 @@ impl remote::RemoteClientDelegate for RemoteClientDelegate {
                 prompt.set_transfer_progress(progress, cx);
             })
             .ok();
+    }
+
+    fn should_create_managed_ssh_key(&self) -> bool {
+        self.create_managed_key.load(Ordering::Relaxed)
     }
 
     fn download_server_binary_locally(
@@ -890,10 +948,12 @@ pub fn connect(
     let (tx, mut rx) = oneshot::channel();
     ui.update(cx, |ui, _cx| ui.set_cancellation_tx(tx));
 
+    let create_managed_key = ui.read(cx).create_managed_key.clone();
     let delegate = Arc::new(RemoteClientDelegate {
         window,
         ui: ui.downgrade(),
         known_password,
+        create_managed_key,
     });
 
     cx.spawn(async move |cx| {
@@ -917,6 +977,15 @@ mod tests {
     use settings::SettingsStore;
 
     use super::*;
+
+    #[test]
+    fn recognizes_only_account_password_prompts() {
+        assert!(is_account_password_prompt("user@example.com's password:"));
+        assert!(!is_account_password_prompt(
+            "Enter passphrase for key '/home/user/.ssh/id_ed25519':"
+        ));
+        assert!(!is_account_password_prompt("Are you sure (yes/no)?"));
+    }
 
     #[gpui::test]
     fn clamps_and_clears_transfer_progress(cx: &mut TestAppContext) {

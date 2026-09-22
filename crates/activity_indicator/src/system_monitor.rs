@@ -143,15 +143,9 @@ pub struct SystemMonitor {
 impl SystemMonitor {
     pub fn new(workspace: &Workspace, cx: &mut App) -> Entity<Self> {
         let remote_client = workspace.project().read(cx).remote_client();
-        let remote_name = remote_client.as_ref().map(|client| {
-            let options = client.read(cx).connection_options();
-            match options {
-                remote::RemoteConnectionOptions::Ssh(options) => options.host.to_string(),
-                remote::RemoteConnectionOptions::Wsl(options) => options.distro_name,
-                remote::RemoteConnectionOptions::Docker(options) => options.container_id,
-                remote::RemoteConnectionOptions::Mock(_) => "远程主机".into(),
-            }
-        });
+        let remote_name = remote_client
+            .as_ref()
+            .map(|client| client.read(cx).connection_options().host());
         cx.new(|cx| {
             let refresh_task = cx.spawn({
                 let remote_client = remote_client.clone();

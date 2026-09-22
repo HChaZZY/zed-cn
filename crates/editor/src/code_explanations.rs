@@ -2914,6 +2914,11 @@ struct ScannedFileResult {
     error: Option<String>,
 }
 
+enum PreparedProjectScan {
+    Skipped,
+    Units(Vec<(crate::code_explanation_units::Unit, String, String)>),
+}
+
 async fn run_project_scan(
     project: &gpui::Entity<project::Project>,
     state: &gpui::Entity<ProjectScanState>,
@@ -3029,19 +3034,6 @@ async fn scan_project_file(
             ..Default::default()
         });
     }
-    let leading_text = snapshot
-        .text_for_range(0..snapshot.len().min(4096))
-        .collect::<String>();
-    let leading_lower = leading_text.to_ascii_lowercase();
-    if leading_lower.contains("do not edit")
-        && (leading_lower.contains("generated") || leading_lower.contains("auto-generated"))
-        || snapshot.text().lines().any(|line| line.len() >= 20 * 1024)
-    {
-        return Ok(ScannedFileResult {
-            skipped: true,
-            ..Default::default()
-        });
-    }
     let settings = cx.update(|cx| CodeExplanationSettings::get_global(cx).clone());
     let expected_settings = format!("{settings:?}");
     let expected_version = snapshot.version().clone();
@@ -3077,33 +3069,78 @@ async fn scan_project_file(
         .join("code-explanations")
         .join(format!("{}.sqlite", content_hash(&cache_namespace)));
     let provider_configuration = cx.update(|cx| selected_provider_configuration(&settings, cx));
-    let units = crate::code_explanation_units::fit_units_to_budget(
-        &snapshot,
-        crate::code_explanation_units::file_units(&snapshot, settings.max_function_lines),
-        crate::code_explanation_units::request_code_budget(model.model.max_token_count()),
-        |text| model.model.estimate_tokens(text),
-    );
-    let mut result = ScannedFileResult::default();
-    let prepared_units = units
-        .into_iter()
-        .filter_map(|unit| {
-            let code = snapshot
-                .text_for_range(unit.range.clone())
-                .collect::<String>();
-            if code.is_empty() {
-                return None;
+    let prepared_units = {
+        let snapshot = snapshot.clone();
+        let model = model.model.clone();
+        let settings = settings.clone();
+        let provider_configuration = provider_configuration.clone();
+        let language = language.clone();
+        let cancelled = cancelled.clone();
+        cx.background_spawn(async move {
+            if snapshot.len() > 512 * 1024
+                || snapshot.max_point().row >= 20_000
+                || cancelled.load(Ordering::SeqCst)
+            {
+                return PreparedProjectScan::Skipped;
             }
-            let key = format!(
-                "v6:{provider_configuration}:{:?}:{:?}:{}:{}:{}",
-                settings.provider,
-                settings.model,
-                settings.target_language,
-                settings.detailed,
-                content_hash(&format!("{language}\n{}\n{}", unit.context, code))
+            let leading_end = snapshot
+                .as_rope()
+                .floor_char_boundary(snapshot.len().min(4096));
+            let leading_lower = snapshot
+                .text_for_range(0..leading_end)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            if leading_lower.contains("do not edit")
+                && (leading_lower.contains("generated") || leading_lower.contains("auto-generated"))
+                || snapshot.text().lines().any(|line| line.len() >= 20 * 1024)
+                || cancelled.load(Ordering::SeqCst)
+            {
+                return PreparedProjectScan::Skipped;
+            }
+            let units = crate::code_explanation_units::fit_units_to_budget(
+                &snapshot,
+                crate::code_explanation_units::file_units(&snapshot, settings.max_function_lines),
+                crate::code_explanation_units::request_code_budget(model.max_token_count()),
+                |text| model.estimate_tokens(text),
             );
-            Some((unit, code, key))
+            PreparedProjectScan::Units(
+                units
+                    .into_iter()
+                    .filter_map(|unit| {
+                        if cancelled.load(Ordering::SeqCst) {
+                            return None;
+                        }
+                        let code = snapshot
+                            .text_for_range(unit.range.clone())
+                            .collect::<String>();
+                        if code.is_empty() {
+                            return None;
+                        }
+                        let key = format!(
+                            "v6:{provider_configuration}:{:?}:{:?}:{}:{}:{}",
+                            settings.provider,
+                            settings.model,
+                            settings.target_language,
+                            settings.detailed,
+                            content_hash(&format!("{language}\n{}\n{}", unit.context, code))
+                        );
+                        Some((unit, code, key))
+                    })
+                    .collect(),
+            )
         })
-        .collect::<Vec<_>>();
+        .await
+    };
+    let prepared_units = match prepared_units {
+        PreparedProjectScan::Skipped => {
+            return Ok(ScannedFileResult {
+                skipped: true,
+                ..Default::default()
+            });
+        }
+        PreparedProjectScan::Units(units) => units,
+    };
+    let mut result = ScannedFileResult::default();
     if prepared_units.is_empty() {
         result.skipped = true;
         result.error = Some(format!(

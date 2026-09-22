@@ -54,6 +54,8 @@ use workspace::{
     open_remote_project_with_existing_connection,
 };
 
+struct ManagedSshKeyManagementToast;
+
 pub struct RemoteServerProjects {
     mode: Mode,
     focus_handle: FocusHandle,
@@ -986,6 +988,7 @@ enum RemoteMatch {
     AddDevContainer,
     AddWsl,
     EditSshConfig,
+    ManageSshKeys,
     Separator,
     ServerHeader {
         server: usize,
@@ -1081,6 +1084,7 @@ impl RemoteServerPickerDelegate {
                 matches.push(RemoteMatch::AddWsl);
             }
             matches.push(RemoteMatch::EditSshConfig);
+            matches.push(RemoteMatch::ManageSshKeys);
         }
 
         let push_server = |matches: &mut Vec<RemoteMatch>,
@@ -1361,6 +1365,11 @@ impl PickerDelegate for RemoteServerPickerDelegate {
                     .update(cx, |this, cx| this.edit_local_ssh_config(window, cx))
                     .log_err();
             }
+            RemoteMatch::ManageSshKeys => {
+                remote_server_projects
+                    .update(cx, |this, cx| this.manage_ssh_keys(window, cx))
+                    .log_err();
+            }
             RemoteMatch::Project {
                 server, project, ..
             } => {
@@ -1483,6 +1492,9 @@ impl PickerDelegate for RemoteServerPickerDelegate {
             }
             RemoteMatch::EditSshConfig => {
                 Some(self.render_action_item(ix, IconName::Settings, "编辑本机 SSH 配置", selected))
+            }
+            RemoteMatch::ManageSshKeys => {
+                Some(self.render_action_item(ix, IconName::Server, "管理 Zed SSH 密钥", selected))
             }
             RemoteMatch::OpenFolder { .. } => {
                 Some(self.render_action_item(ix, IconName::Plus, "Open Folder", selected))
@@ -3212,6 +3224,114 @@ impl RemoteServerProjects {
             .size_full()
             .child(self.default_picker.clone())
             .into_any_element()
+    }
+
+    fn manage_ssh_keys(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let keys = match remote::list_managed_ssh_keys() {
+            Ok(keys) => keys,
+            Err(error) => {
+                let confirmation = window.prompt(
+                    PromptLevel::Critical,
+                    "无法读取 Zed SSH 密钥",
+                    Some(&error.to_string()),
+                    &["确定"],
+                    cx,
+                );
+                cx.spawn(async move |_, _| {
+                    confirmation.await.ok();
+                })
+                .detach();
+                return;
+            }
+        };
+        if keys.is_empty() {
+            let confirmation = window.prompt(
+                PromptLevel::Info,
+                "没有 Zed 管理的 SSH 密钥",
+                Some("在密码连接时勾选“创建此主机的 Zed 专属 SSH 密钥”后，密钥会显示在这里。"),
+                &["确定"],
+                cx,
+            );
+            cx.spawn(async move |_, _| {
+                confirmation.await.ok();
+            })
+            .detach();
+            return;
+        }
+
+        let summary = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                format!(
+                    "{}. {}@{}:{}\n   创建：{}  最近使用：{}\n   指纹：{}  状态：{}",
+                    index + 1,
+                    key.remote_username,
+                    key.host,
+                    key.port,
+                    key.created_at,
+                    key.last_used_at.as_deref().unwrap_or("从未"),
+                    key.key_id,
+                    match key.deployment_state {
+                        remote::ManagedSshKeyDeploymentState::Pending => "待验证",
+                        remote::ManagedSshKeyDeploymentState::Verified => "已验证",
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let mut target_buttons = vec!["关闭".to_string()];
+            target_buttons.extend(keys.iter().map(|key| {
+                format!("{}@{}:{}", key.remote_username, key.host, key.port)
+            }));
+            let target_button_refs = target_buttons
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let selected = cx
+                .prompt(
+                    PromptLevel::Info,
+                    "Zed SSH 密钥管理",
+                    Some(&summary),
+                    &target_button_refs,
+                )
+                .await?;
+            if selected == 0 {
+                return Ok::<(), anyhow::Error>(());
+            }
+            let Some(key) = keys.get(selected - 1) else {
+                anyhow::bail!("选择的 SSH 密钥已不存在");
+            };
+            let answer = cx
+                .prompt(
+                    PromptLevel::Warning,
+                    &format!("管理 {}@{}:{}", key.remote_username, key.host, key.port),
+                    Some("远程撤销成功后才会删除本地私钥。仅删除本地密钥会在服务器上保留无法再由 Zed 自动清理的公钥。"),
+                    &["取消", "撤销远程并删除", "仅删除本地"],
+                )
+                .await?;
+            match answer {
+                1 => remote::revoke_and_delete_managed_ssh_key(&key.key_id).await?,
+                2 => remote::delete_local_managed_ssh_key(&key.key_id)?,
+                _ => return Ok(()),
+            }
+            if let Some(workspace) = workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.show_toast(
+                        Toast::new(
+                            NotificationId::unique::<ManagedSshKeyManagementToast>(),
+                            "Zed SSH 密钥操作已完成",
+                        )
+                        .autohide(),
+                        cx,
+                    );
+                });
+            }
+            Ok(())
+        })
+        .detach_and_prompt_err("SSH 密钥操作失败", window, cx, |_, _, _| None);
     }
 
     fn edit_local_ssh_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
