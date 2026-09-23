@@ -40,7 +40,7 @@ use language::LanguageRegistry;
 use onboarding::{FIRST_OPEN, show_onboarding_view};
 use project_panel::ProjectPanel;
 use prompt_store::PromptBuilder;
-use remote::RemoteConnectionOptions;
+use remote::{RemoteConnectionOptions, remote_client::MachineIdentity};
 use reqwest_client::ReqwestClient;
 
 use assets::Assets;
@@ -598,6 +598,12 @@ fn main() {
 
         let system_id = cx.foreground_executor().block_on(system_id).ok();
         let installation_id = cx.foreground_executor().block_on(installation_id).ok();
+        if let Some(installation_id) = installation_id.as_ref() {
+            // Namespaces remote server session names to this installation so
+            // that two machines connecting to the same remote account never
+            // share, and therefore never replace, each other's sessions.
+            cx.set_global(MachineIdentity::new(installation_id.to_string()));
+        }
         let session = cx.foreground_executor().block_on(session);
 
         let telemetry = client.telemetry();

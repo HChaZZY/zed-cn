@@ -7,7 +7,7 @@ use anyhow::{Context as _, Result};
 use gpui::{AppContext as _, AsyncApp};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use smol::process::Stdio;
+use util::command::Stdio;
 use uuid::Uuid;
 
 use crate::SshConnectionOptions;
