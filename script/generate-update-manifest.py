@@ -16,6 +16,9 @@ ASSETS = {
     for arch in ("x86_64", "aarch64")
     for prefix, suffix in (("Zed-", ".exe"), ("Zed-", ".dmg"), ("zed-linux-", ".tar.gz"))
 }
+# Uploaded last, after every binary and checksum succeeds, so its presence marks
+# a release as complete.
+MARKER_ASSET = "update-metadata.json"
 
 
 def command(*arguments):
@@ -105,15 +108,41 @@ def release_metadata(directory, tag, commit, title="", release_notes=""):
     })
 
 
-def build_manifest(releases, load_metadata):
+def uploaded_assets(release):
+    """Authoritative uploaded assets of one release, keyed by name.
+
+    The ``assets`` array embedded in the releases list and by-tag endpoints can
+    lag an upload: a release that already had every asset reported an empty
+    embedded array for a long time, which silently dropped the newest revision
+    from the update feed. The per-release asset endpoint is authoritative, so
+    always read that and only use the embedded list to report the discrepancy.
+    """
+    pages = json.loads(command(
+        "gh", "api", "--paginate", "--slurp",
+        f"repos/{REPOSITORY}/releases/{release['id']}/assets?per_page=100",
+    ))
+    assets = {asset["name"]: asset for page in pages for asset in page
+              if asset.get("state") == "uploaded" and asset.get("size", 0) > 0}
+    embedded = {asset["name"] for asset in release.get("assets", [])}
+    if assets and not embedded:
+        print(f"WARNING: {release['tag_name']}: the releases list reported no assets; "
+              f"using the per-release asset listing ({len(assets)} assets).",
+              file=sys.stderr)
+    return assets
+
+
+def build_manifest(releases, load_metadata, load_uploaded_assets):
     result = []
     for release in releases:
         if release["draft"] or release["prerelease"] or not TAG.fullmatch(release["tag_name"]):
             continue
-        uploaded = {asset["name"]: asset for asset in release["assets"]
-                    if asset["state"] == "uploaded" and asset["size"] > 0}
+        uploaded = load_uploaded_assets(release)
         # This marker is uploaded last, after all binaries and checksums succeed.
-        if "update-metadata.json" not in uploaded:
+        if MARKER_ASSET not in uploaded:
+            # Never skip silently: an unpublished or half-uploaded release must
+            # be visible in the job log instead of quietly missing from the feed.
+            print(f"WARNING: Skipping {release['tag_name']}: no uploaded "
+                  f"{MARKER_ASSET} completion marker.", file=sys.stderr)
             continue
         try:
             metadata = validate_release(load_metadata(release["tag_name"]))
@@ -162,8 +191,8 @@ def main():
         releases = [release for page in pages for release in page]
         result = build_manifest(releases, lambda tag: json.loads(command(
             "gh", "release", "download", tag, "--repo", REPOSITORY,
-            "--pattern", "update-metadata.json", "--output", "-",
-        )))
+            "--pattern", MARKER_ASSET, "--output", "-",
+        )), uploaded_assets)
     content = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
     if len(content.encode("utf-8")) > 8 * 1024 * 1024:
         raise ValueError("Update manifest exceeds the client size limit")

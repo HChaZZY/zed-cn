@@ -1,7 +1,7 @@
 use gpui::{
     Action, App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla,
-    InteractiveElement as _, Render, StatefulInteractiveElement as _, Task, WeakEntity, Window,
-    actions, px,
+    InteractiveElement as _, Render, StatefulInteractiveElement as _, Subscription, Task,
+    WeakEntity, Window, actions, px,
 };
 use proto::GetSystemStatsResponse;
 use std::{collections::VecDeque, time::Duration};
@@ -139,6 +139,8 @@ pub struct SystemMonitor {
     remote_name: Option<String>,
     error: Option<String>,
     _refresh_task: Task<()>,
+    right_dock: Entity<workspace::dock::Dock>,
+    _dock_subscription: Subscription,
 }
 
 impl SystemMonitor {
@@ -147,7 +149,9 @@ impl SystemMonitor {
         let remote_name = remote_client
             .as_ref()
             .map(|client| client.read(cx).connection_options().host());
+        let right_dock = workspace.right_dock().clone();
         cx.new(|cx| {
+            let dock_subscription = cx.observe(&right_dock, |_, _, cx| cx.notify());
             let refresh_task = cx.spawn({
                 let remote_client = remote_client.clone();
                 async move |this: WeakEntity<SystemMonitor>, cx| {
@@ -196,6 +200,8 @@ impl SystemMonitor {
                 remote_name,
                 error: None,
                 _refresh_task: refresh_task,
+                right_dock,
+                _dock_subscription: dock_subscription,
             }
         })
     }
@@ -308,8 +314,17 @@ impl SystemMonitor {
 impl Render for SystemMonitor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let monitor = cx.entity();
+        let dock = self.right_dock.read(cx);
+        let open = dock
+            .visible_panel()
+            .is_some_and(|panel| panel.panel_key() == SYSTEM_MONITOR_PANEL_KEY);
         IconButton::new("system-monitor-status", IconName::Gauge)
             .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .selected_icon_color(Color::Accent)
+            .toggle_state(open)
+            .aria_label("系统监控")
+            .aria_expanded(open)
             .tooltip(ui::Tooltip::element(move |_, cx| {
                 monitor.read(cx).tooltip_element()
             }))

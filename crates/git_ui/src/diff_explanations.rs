@@ -240,6 +240,7 @@ impl DiffExplanationController {
                                     element.child(
                                         h_flex()
                                             .min_w_0()
+                                            .items_start()
                                             .gap_1()
                                             .child(
                                                 Disclosure::new(

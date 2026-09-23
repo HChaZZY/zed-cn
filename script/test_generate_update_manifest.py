@@ -30,13 +30,30 @@ def release(data):
     return result
 
 
+def embedded_assets(release):
+    """The released assets as embedded in the release object.
+
+    Production reads the authoritative per-release endpoint; unit tests inject
+    this loader to exercise the manifest rules without network access.
+    """
+    return {asset["name"]: asset for asset in release["assets"]
+            if asset["state"] == "uploaded" and asset["size"] > 0}
+
+
 class ManifestTests(unittest.TestCase):
     def setUp(self):
         def api(*arguments):
             self.assertEqual(arguments[:2], ("gh", "api"))
-            tag = arguments[2].rsplit("/", 1)[1]
+            endpoint = arguments[-1]
+            if endpoint.endswith("/assets?per_page=100"):
+                release_id = int(endpoint.rsplit("/", 2)[1])
+                entry = next(entry for entry in self.listed_releases
+                             if entry["id"] == release_id)
+                return json.dumps([entry["assets"]])
+            tag = endpoint.rsplit("/", 1)[1]
             return json.dumps({"ref": f"refs/tags/{tag}",
                                "object": {"type": "commit", "sha": "a" * 40}})
+        self.listed_releases = []
         self.command = patch.object(manifest, "command", side_effect=api).start()
         self.addCleanup(patch.stopall)
 
@@ -44,11 +61,11 @@ class ManifestTests(unittest.TestCase):
         data = metadata()
         entry = release(data)
         entry["target_commitish"] = "main"
-        self.assertEqual(manifest.build_manifest([entry], lambda tag: data)["releases"], [data])
+        self.assertEqual(manifest.build_manifest([entry], lambda tag: data, embedded_assets)["releases"], [data])
         data["target_commitish"] = "c" * 40
         with patch("sys.stderr", new_callable=io.StringIO) as warnings:
             with self.assertRaisesRegex(ValueError, "No completed desktop"):
-                manifest.build_manifest([entry], lambda tag: data)
+                manifest.build_manifest([entry], lambda tag: data, embedded_assets)
         self.assertIn("source commit differs", warnings.getvalue())
 
     def test_zero_desktop_skipped_with_historical_platform_fallback(self):
@@ -63,10 +80,10 @@ class ManifestTests(unittest.TestCase):
         releases[-1]["assets"].append({"name": "zed-remote-server-linux-x86_64.gz",
                                       "state": "uploaded", "size": 3})
         result = manifest.build_manifest(releases, lambda tag: next(
-            item for item in entries if item["tag_name"] == tag))
+            item for item in entries if item["tag_name"] == tag), embedded_assets)
         self.assertEqual(result["releases"], [linux, windows])
         with self.assertRaisesRegex(ValueError, "No completed desktop"):
-            manifest.build_manifest([releases[-1]], lambda tag: empty)
+            manifest.build_manifest([releases[-1]], lambda tag: empty, embedded_assets)
 
     def test_retired_intel_macos_history_is_preserved_without_new_asset(self):
         intel, arm = metadata(1), metadata(2)
@@ -77,7 +94,7 @@ class ManifestTests(unittest.TestCase):
                 f"{entry['tag_name']}/{name}")
         entries = [intel, arm]
         result = manifest.build_manifest([release(entry) for entry in entries], lambda tag: next(
-            entry for entry in entries if entry["tag_name"] == tag))
+            entry for entry in entries if entry["tag_name"] == tag), embedded_assets)
         self.assertEqual(result["releases"], [arm, intel])
         self.assertEqual([asset["name"] for asset in result["releases"][0]["assets"]],
                          ["Zed-aarch64.dmg"])
@@ -90,7 +107,12 @@ class ManifestTests(unittest.TestCase):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
                 output = Path(temporary) / "updates.json"
                 output.write_text("previous feed")
-                self.command.side_effect = [json.dumps([[release(data)]]), json.dumps(data), failure]
+                entry = release(data)
+                entry["id"] = 1
+                self.listed_releases = [entry]
+                self.command.side_effect = [json.dumps([[entry]]),
+                                            json.dumps([entry["assets"]]),
+                                            json.dumps(data), failure]
                 with patch("sys.argv", ["generate-update-manifest.py", "--output", str(output)]):
                     with self.assertRaises((ValueError, subprocess.CalledProcessError)):
                         manifest.main()
@@ -106,7 +128,7 @@ class ManifestTests(unittest.TestCase):
                     raise failure
                 return new
             with self.subTest(failure=failure), patch("sys.stderr", new_callable=io.StringIO) as warnings:
-                result = manifest.build_manifest([release(old), release(new)], load)
+                result = manifest.build_manifest([release(old), release(new)], load, embedded_assets)
                 self.assertEqual(result["releases"], [new])
                 self.assertIn("Skipping " + old["tag_name"], warnings.getvalue())
 
@@ -128,7 +150,7 @@ class ManifestTests(unittest.TestCase):
                 marker = {}
             with self.subTest(failure=failure), patch("sys.stderr", new_callable=io.StringIO) as warnings:
                 result = manifest.build_manifest([entry, release(old)],
-                    lambda tag: marker if tag == new["tag_name"] else old)
+                    lambda tag: marker if tag == new["tag_name"] else old, embedded_assets)
                 self.assertEqual(result["releases"], [old])
                 self.assertIn("Skipping " + new["tag_name"], warnings.getvalue())
 
@@ -137,7 +159,7 @@ class ManifestTests(unittest.TestCase):
         with patch.object(manifest, "resolve_tag_commit", side_effect=[
                 subprocess.CalledProcessError(1, "gh"), "a" * 40]):
             result = manifest.build_manifest([release(old), release(new)],
-                lambda tag: old if tag == old["tag_name"] else new)
+                lambda tag: old if tag == old["tag_name"] else new, embedded_assets)
         self.assertEqual(result["releases"], [new])
 
     def test_release_listing_failure_preserves_existing_output(self):
@@ -162,7 +184,8 @@ class ManifestTests(unittest.TestCase):
     def test_history_sorted_numerically_and_partial_platforms_preserved(self):
         entries = [metadata(2), metadata(10)]
         result = manifest.build_manifest([release(item) for item in entries],
-                                         lambda tag: next(item for item in entries if item["tag_name"] == tag))
+                                         lambda tag: next(item for item in entries if item["tag_name"] == tag),
+                                         embedded_assets)
         self.assertEqual([item["tag_name"] for item in result["releases"]],
                          ["zed-cn-v1.18.1-r10", "zed-cn-v1.18.1-r2"])
         self.assertEqual(len(result["releases"][0]["assets"]), 1)
@@ -174,7 +197,8 @@ class ManifestTests(unittest.TestCase):
         entries[1]["prerelease"] = True
         entries[2]["assets"].pop()
         with self.assertRaises(ValueError):
-            manifest.build_manifest(entries, lambda tag: self.fail("Must not fetch unpublished metadata"))
+            manifest.build_manifest(entries, lambda tag: self.fail("Must not fetch unpublished metadata"),
+                                embedded_assets)
 
     def test_bad_asset_identity_size_digest_and_url_rejected(self):
         data = metadata()
@@ -183,11 +207,11 @@ class ManifestTests(unittest.TestCase):
             entry = release(data)
             entry["assets"][0][field] = value
             with self.subTest(field=field), self.assertRaises(ValueError):
-                manifest.build_manifest([entry], lambda tag: data)
+                manifest.build_manifest([entry], lambda tag: data, embedded_assets)
         entry = release(data)
         entry["assets"].pop(0)
         with self.assertRaises(ValueError):
-            manifest.build_manifest([entry], lambda tag: data)
+            manifest.build_manifest([entry], lambda tag: data, embedded_assets)
 
     def test_metadata_validation(self):
         for field, value in (("tag_name", "../tag"), ("target_commitish", "main")):
@@ -322,3 +346,77 @@ class ResolveTagCommitTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AssetListingTests(unittest.TestCase):
+    """The releases list embedded ``assets`` array must not decide completeness.
+
+    A published release once reported an empty embedded asset array for a long
+    time while every asset was present, so the newest revision silently vanished
+    from the update feed. The per-release asset endpoint is authoritative.
+    """
+
+    tag = "zed-cn-v1.20.2-r12"
+    commit = "b" * 40
+
+    def entry(self):
+        data = metadata(1)
+        data["tag_name"] = self.tag
+        data["target_commitish"] = self.commit
+        data["assets"] = [dict(data["assets"][0], browser_download_url=(
+            f"https://github.com/{manifest.REPOSITORY}/releases/download/"
+            f"{self.tag}/Zed-x86_64.exe"))]
+        return data
+
+    def assets(self, entry, marker=True):
+        assets = [dict(asset, browser_download_url=(
+            f"https://github.com/{manifest.REPOSITORY}/releases/download/"
+            f"{self.tag}/{asset['name']}")) for asset in entry["assets"]]
+        if marker:
+            assets.append({"name": manifest.MARKER_ASSET, "state": "uploaded", "size": 100})
+        return assets
+
+    def build(self, embedded, assets):
+        data = self.entry()
+        release_entry = release(data)
+        release_entry["id"] = 7
+        release_entry["assets"] = embedded
+        errors = io.StringIO()
+
+        def api(*arguments):
+            self.assertEqual(arguments[:2], ("gh", "api"))
+            endpoint = arguments[-1]
+            if endpoint.endswith("/assets?per_page=100"):
+                return json.dumps([assets])
+            if endpoint.endswith("releases?per_page=100"):
+                return json.dumps([[release_entry]])
+            return json.dumps({"ref": f"refs/tags/{self.tag}",
+                               "object": {"type": "commit", "sha": self.commit}})
+
+        with patch.object(manifest, "command", side_effect=api), \
+                patch("sys.stderr", new_callable=io.StringIO) as warnings:
+            try:
+                result = manifest.build_manifest(
+                    [release_entry], lambda tag: data, manifest.uploaded_assets)
+                entries = result["releases"]
+            except ValueError:
+                # An empty feed is refused; the caller inspects the warnings.
+                entries = None
+        return entries, warnings.getvalue()
+
+    def test_empty_embedded_asset_list_does_not_drop_the_release(self):
+        entries, _ = self.build(embedded=[], assets=self.assets(self.entry()))
+        self.assertEqual([entry["tag_name"] for entry in entries], [self.tag])
+
+    def test_empty_embedded_asset_list_is_reported(self):
+        _, warnings = self.build(embedded=[], assets=self.assets(self.entry()))
+        self.assertIn("using the per-release asset listing", warnings)
+
+    def test_missing_completion_marker_warns_instead_of_skipping_silently(self):
+        # An incomplete release is skipped loudly, and refusing to publish an
+        # empty feed still surfaces the reason instead of succeeding silently.
+        entries, warnings = self.build(
+            embedded=[], assets=self.assets(self.entry(), marker=False))
+        self.assertIsNone(entries)
+        self.assertIn(f"WARNING: Skipping {self.tag}", warnings)
+        self.assertIn(manifest.MARKER_ASSET, warnings)

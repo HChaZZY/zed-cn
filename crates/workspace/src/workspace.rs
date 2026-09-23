@@ -4790,6 +4790,24 @@ impl Workspace {
         result_panel
     }
 
+    /// Toggle whether the panel of the given type is visible, regardless of focus.
+    pub fn toggle_panel_visibility<T: Panel>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_visible = self.all_docks().iter().any(|dock| {
+            let dock = dock.read(cx);
+            dock.visible_panel()
+                .is_some_and(|panel| panel.panel_key() == T::panel_key())
+        });
+        if is_visible {
+            self.close_panel::<T>(window, cx);
+        } else {
+            self.focus_panel::<T>(window, cx);
+        }
+    }
+
     /// Open the panel of the given type
     pub fn open_panel<T: Panel>(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for dock in self.all_docks() {
@@ -14595,6 +14613,42 @@ mod tests {
             let (top, nested) = nested_axis(workspace);
             assert_eq!(*top.flexes.lock(), vec![1.0; top.members.len()]);
             assert_eq!(*nested.flexes.lock(), vec![1.0; nested.members.len()]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_toggle_panel_visibility_independent_of_focus(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_visibility::<TestPanel>(window, cx);
+            assert!(workspace.right_dock().read(cx).is_open());
+            assert!(panel.read(cx).focus_handle(cx).contains_focused(window, cx));
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<TestPanel>(window, cx);
+            assert!(!panel.read(cx).focus_handle(cx).contains_focused(window, cx));
+            assert!(workspace.right_dock().read(cx).is_open());
+            workspace.toggle_panel_visibility::<TestPanel>(window, cx);
+            assert!(!workspace.right_dock().read(cx).is_open());
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_visibility::<TestPanel>(window, cx);
+            assert!(workspace.right_dock().read(cx).is_open());
+            workspace.toggle_panel_visibility::<TestPanel>(window, cx);
+            assert!(!workspace.right_dock().read(cx).is_open());
         });
     }
 

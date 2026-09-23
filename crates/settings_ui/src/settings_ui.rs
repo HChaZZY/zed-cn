@@ -3690,7 +3690,7 @@ impl SettingsWindow {
             .gap_1()
             .child(Label::new("无结果"))
             .child(
-                Label::new(format!("No settings match \"{}\"", search_query))
+                Label::new(format!("没有匹配“{}”的设置", search_query))
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
@@ -3895,7 +3895,8 @@ impl SettingsWindow {
         if let Some(current_sub_page) = self.sub_page_stack.last() {
             let is_skills_page =
                 current_sub_page.link.json_path == Some(AGENT_SKILLS_SETTINGS_PATH);
-            let is_llm_providers_page = is_llm_providers_page(current_sub_page.link.json_path);
+            let is_llm_providers_page = self.sub_page_stack.len() == 1
+                && is_llm_providers_page(current_sub_page.link.json_path);
             let is_external_agents_page = current_sub_page.link.json_path == Some("agent_servers");
             let is_mcp_servers_page = current_sub_page.link.json_path == Some("context_servers");
 
@@ -4573,10 +4574,16 @@ impl SettingsWindow {
     pub(crate) fn pop_sub_page(&mut self, window: &mut Window, cx: &mut Context<SettingsWindow>) {
         self.regex_validation_error = None;
         self.sandbox_host_validation_error = None;
-        if let Some(popped) = self.sub_page_stack.pop()
-            && popped.link.r#type == SubPageType::SkillCreator
-        {
-            self.skill_creator_page = None;
+        if let Some(popped) = self.sub_page_stack.pop() {
+            if popped.link.r#type == SubPageType::SkillCreator {
+                self.skill_creator_page = None;
+            }
+            if popped.link.json_path == Some("llm_providers")
+                && (popped.link.title.starts_with("添加 ")
+                    || popped.link.title.starts_with("编辑提供商："))
+            {
+                self.llm_provider_form = None;
+            }
         }
         self.content_focus_handle.focus_handle(cx).focus(window, cx);
         cx.notify();

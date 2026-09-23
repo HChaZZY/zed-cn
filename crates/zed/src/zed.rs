@@ -610,10 +610,9 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let system_monitor = activity_indicator::system_monitor::SystemMonitor::new(workspace, cx);
         workspace.register_action(
             |workspace, _: &activity_indicator::system_monitor::ToggleFocus, window, cx| {
-                workspace
-                    .toggle_panel_focus::<activity_indicator::system_monitor::SystemMonitorPanel>(
-                        window, cx,
-                    );
+                workspace.toggle_panel_visibility::<
+                    activity_indicator::system_monitor::SystemMonitorPanel,
+                >(window, cx);
             },
         );
         let system_monitor_panel = cx.new(|cx| {

@@ -9021,7 +9021,7 @@ fn code_explanations_section() -> [SettingsPageItem; 12] {
 fn ai_page(cx: &App) -> SettingsPage {
     fn general_section() -> [SettingsPageItem; 8] {
         [
-            SettingsPageItem::SectionHeader("General"),
+            SettingsPageItem::SectionHeader("基础设置"),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "禁用 AI",
                 description: "是否禁用 Zed 中的所有 AI 功能。",
@@ -9112,10 +9112,10 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SubPageLink(SubPageLink {
-                title: "LLM 提供者".into(),
+                title: "语言模型提供商".into(),
                 r#type: Default::default(),
                 json_path: Some("llm_providers"),
-                description: Some("Configure natively-included model providers.".into()),
+                description: Some("管理 Agent 使用的模型服务与 API 密钥；翻译、代码讲解和编辑预测分别选择模型或提供商。".into()),
                 search_aliases: &[
                     "ai",
                     "amazon",
@@ -9151,8 +9151,7 @@ fn ai_page(cx: &App) -> SettingsPage {
                 r#type: Default::default(),
                 json_path: Some("agent_servers"),
                 description: Some(
-                    "View, add, and remove agents connected through the Agent Client Protocol."
-                        .into(),
+                    "管理通过 Agent 客户端协议连接的外部 Agent。".into(),
                 ),
                 search_aliases: &[
                     "acp",
@@ -9179,7 +9178,7 @@ fn ai_page(cx: &App) -> SettingsPage {
                 r#type: Default::default(),
                 json_path: Some("context_servers"),
                 description: Some(
-                    "View, add, configure, and remove Model Context Protocol servers.".into(),
+                    "管理向 Agent 提供工具与上下文的 MCP 服务器。".into(),
                 ),
                 search_aliases: &["context server", "mcp", "model context protocol"],
                 in_json: false,
@@ -9197,7 +9196,7 @@ fn ai_page(cx: &App) -> SettingsPage {
                 title: "技能".into(),
                 r#type: Default::default(),
                 json_path: Some(zed_actions::AGENT_SKILLS_SETTINGS_PATH),
-                description: Some("View and manage agent skills installed globally or in project worktrees.".into()),
+                description: Some("管理全局和项目中的 Agent 技能。".into()),
                 search_aliases: &["agent skill", "agent skills", "custom instructions", "skill", "skills"],
                 in_json: false,
                 files: USER | PROJECT,
@@ -11584,10 +11583,12 @@ fn edit_prediction_language_settings_section() -> [SettingsPageItem; 5] {
     [
         SettingsPageItem::SectionHeader("编辑预测"),
         SettingsPageItem::SubPageLink(SubPageLink {
-            title: "配置提供者".into(),
+            title: "配置编辑预测提供商".into(),
             r#type: Default::default(),
             json_path: Some("edit_predictions.providers"),
-            description: Some("设置不同的编辑预测提供者，以补充 Zed 内置的 Zeta 模型。".into()),
+            description: Some(
+                "编辑预测与 Agent 聊天模型分开配置；可选择 Zeta、Copilot 或其他兼容提供商。".into(),
+            ),
             search_aliases: &[],
             in_json: false,
             files: USER,

@@ -13,6 +13,8 @@ use language_model::{
     ApiKeyConfiguration, CreateProviderSettingsView, IconOrSvg, InlineDescription,
     LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry, ProviderSettingsView,
 };
+use language_models::AllLanguageModelSettings;
+use settings::Settings as _;
 
 use settings::{
     AnthropicCompatibleAvailableModel, AnthropicCompatibleModelCapabilities,
@@ -43,6 +45,7 @@ pub(crate) fn render_llm_providers_page(
         .pb_16()
         .track_scroll(scroll_handle)
         .overflow_y_scroll()
+        .child(Label::new("先在此配置提供商和模型，然后到 Agent 的模型选择器选用。翻译、代码讲解与编辑预测分别配置，不会自动切换。").size(LabelSize::Small).color(Color::Muted))
         .children(
             providers
                 .iter()
@@ -230,20 +233,18 @@ fn render_api_key_providers_item(
 
     if has_key {
         let configured_label = if is_from_env_var {
-            "API Key Set in Environment Variable"
+            "API 密钥来自环境变量"
         } else {
-            "API Key Configured"
+            "API 密钥已配置"
         };
         let button_id = format!("reset-api-key-{}", provider_id.0);
 
         let card = ConfiguredApiCard::new(button_id, configured_label)
-            .button_label("Reset Key")
+            .button_label("重置密钥")
             .button_tab_index(0)
             .disabled(is_from_env_var)
             .when(is_from_env_var, |this| {
-                this.tooltip_label(format!(
-                    "To reset your API key, unset the {env_var_name} environment variable."
-                ))
+                this.tooltip_label(format!("若要重置密钥，请清除 {env_var_name} 环境变量。"))
             })
             .on_click({
                 let provider = provider.clone();
@@ -453,7 +454,7 @@ fn open_provider_configuration(
 
     settings_window.push_dynamic_sub_page(
         title,
-        "Agent Configuration",
+        "AI 设置",
         Some("llm_providers"),
         true,
         render_provider_config_sub_page,
@@ -488,6 +489,7 @@ fn render_provider_config_sub_page(
     };
     let view =
         get_or_create_configuration_view(settings_window, &provider_id, create_view, window, cx);
+    let compatible = compatible_provider(&provider_id.0, cx);
 
     v_flex()
         .id("provider-config-sub-page")
@@ -497,8 +499,106 @@ fn render_provider_config_sub_page(
         .pb_16()
         .track_scroll(scroll_handle)
         .overflow_y_scroll()
+        .when_some(compatible, |this, (kind, api_url, count)| {
+            this.child(
+                v_flex()
+                    .gap_2()
+                    .pb_4()
+                    .child(
+                        Label::new(format!(
+                            "{} 兼容接口 · {} 个模型 · {}",
+                            kind.label(),
+                            count,
+                            api_url
+                        ))
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Button::new("edit-compatible-provider", "编辑地址与模型")
+                            .style(ButtonStyle::Outlined)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                open_existing_llm_provider_form(
+                                    this,
+                                    provider_id.clone(),
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    ),
+            )
+        })
         .child(view)
         .into_any_element()
+}
+
+fn compatible_provider(id: &str, cx: &App) -> Option<(CompatibleProviderKind, String, usize)> {
+    let settings = AllLanguageModelSettings::get_global(cx);
+    if let Some(provider) = settings.openai_compatible.get(id) {
+        return Some((
+            CompatibleProviderKind::OpenAi,
+            provider.api_url.clone(),
+            provider.available_models.len(),
+        ));
+    }
+    settings.anthropic_compatible.get(id).map(|provider| {
+        (
+            CompatibleProviderKind::Anthropic,
+            provider.api_url.clone(),
+            provider.available_models.len(),
+        )
+    })
+}
+
+fn open_existing_llm_provider_form(
+    settings_window: &mut SettingsWindow,
+    provider_id: LanguageModelProviderId,
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) {
+    let id = provider_id.0.as_ref();
+    let existing = {
+        let settings = AllLanguageModelSettings::get_global(cx);
+        if let Some(provider) = settings.openai_compatible.get(id) {
+            Some((
+                CompatibleProviderKind::OpenAi,
+                provider.api_url.clone(),
+                ParsedModels::OpenAi(provider.available_models.clone()),
+            ))
+        } else {
+            settings.anthropic_compatible.get(id).map(|provider| {
+                (
+                    CompatibleProviderKind::Anthropic,
+                    provider.api_url.clone(),
+                    ParsedModels::Anthropic(provider.available_models.clone()),
+                )
+            })
+        }
+    };
+    let Some((kind, api_url, existing_models)) = existing else {
+        return;
+    };
+    let models = match existing_models {
+        ParsedModels::OpenAi(models) => models
+            .iter()
+            .map(|model| ModelInput::from_open_ai(model, window, cx))
+            .collect(),
+        ParsedModels::Anthropic(models) => models
+            .iter()
+            .map(|model| ModelInput::from_anthropic(model, window, cx))
+            .collect(),
+    };
+    settings_window.llm_provider_form = Some(LlmProviderForm::for_existing(
+        kind, id, &api_url, models, window, cx,
+    ));
+    settings_window.push_dynamic_sub_page(
+        format!("编辑提供商：{id}"),
+        "AI 设置",
+        Some("llm_providers"),
+        true,
+        render_llm_provider_form_page,
+        window,
+        cx,
+    );
 }
 
 fn get_or_create_configuration_view(
@@ -533,12 +633,16 @@ static NEXT_LLM_PROVIDER_FORM_ID: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct LlmProviderForm {
     id: u64,
     kind: CompatibleProviderKind,
+    editing_name: Option<String>,
+    original_api_url: Option<String>,
     provider_name: Entity<Editor>,
     api_url: Entity<Editor>,
     api_key: Entity<Editor>,
     models: Vec<ModelInput>,
     is_fetching_models: bool,
+    is_saving: bool,
     error: Option<SharedString>,
+    notice: Option<SharedString>,
 }
 
 impl LlmProviderForm {
@@ -550,6 +654,8 @@ impl LlmProviderForm {
         Self {
             id: NEXT_LLM_PROVIDER_FORM_ID.fetch_add(1, Ordering::Relaxed),
             kind,
+            editing_name: None,
+            original_api_url: None,
             provider_name: new_input(kind.label(), None, false, window, cx),
             api_url: new_input(kind.default_api_url(), None, false, window, cx),
             api_key: new_input(
@@ -561,8 +667,29 @@ impl LlmProviderForm {
             ),
             models: Vec::new(),
             is_fetching_models: false,
+            is_saving: false,
             error: None,
+            notice: None,
         }
+    }
+
+    fn for_existing(
+        kind: CompatibleProviderKind,
+        name: &str,
+        api_url: &str,
+        models: Vec<ModelInput>,
+        window: &mut Window,
+        cx: &mut Context<SettingsWindow>,
+    ) -> Self {
+        let mut form = Self::new(kind, window, cx);
+        form.editing_name = Some(name.to_string());
+        form.original_api_url = Some(api_url.to_string());
+        form.provider_name
+            .update(cx, |editor, cx| editor.set_text(name, window, cx));
+        form.api_url
+            .update(cx, |editor, cx| editor.set_text(api_url, window, cx));
+        form.models = models;
+        form
     }
 }
 
@@ -580,6 +707,14 @@ struct ModelInput {
     supports_thinking: ToggleState,
     interleaved_reasoning: ToggleState,
     max_tokens_parameter: ToggleState,
+    expanded: bool,
+    original: Option<OriginalModel>,
+}
+
+#[derive(Clone)]
+enum OriginalModel {
+    OpenAi(OpenAiCompatibleAvailableModel),
+    Anthropic(AnthropicCompatibleAvailableModel),
 }
 
 impl ModelInput {
@@ -614,6 +749,8 @@ impl ModelInput {
             supports_thinking: ToggleState::Unselected,
             interleaved_reasoning: interleaved_reasoning.into(),
             max_tokens_parameter: max_tokens_parameter.into(),
+            expanded: true,
+            original: None,
         }
     }
 
@@ -639,6 +776,80 @@ impl ModelInput {
         input.supports_tools = model.supports_tools.into();
         input.supports_images = model.supports_images.into();
         input.supports_thinking = model.supports_thinking.into();
+        input.expanded = false;
+        input
+    }
+
+    fn from_open_ai(
+        model: &OpenAiCompatibleAvailableModel,
+        window: &mut Window,
+        cx: &mut Context<SettingsWindow>,
+    ) -> Self {
+        let mut input = Self::new(0, window, cx);
+        input.name.update(cx, |editor, cx| {
+            editor.set_text(model.name.as_str(), window, cx)
+        });
+        input.max_tokens.update(cx, |editor, cx| {
+            editor.set_text(model.max_tokens.to_string(), window, cx)
+        });
+        input.max_output_tokens.update(cx, |editor, cx| {
+            editor.set_text(
+                model.max_output_tokens.unwrap_or(32_000).to_string(),
+                window,
+                cx,
+            )
+        });
+        input.max_completion_tokens.update(cx, |editor, cx| {
+            editor.set_text(
+                model.max_completion_tokens.unwrap_or(200_000).to_string(),
+                window,
+                cx,
+            )
+        });
+        input.reasoning_effort = model
+            .reasoning_effort
+            .unwrap_or(OpenAiReasoningEffort::Medium);
+        input.supports_thinking = model.reasoning_effort.is_some().into();
+        input.supports_tools = model.capabilities.tools.into();
+        input.supports_images = model.capabilities.images.into();
+        input.supports_parallel_tool_calls = model.capabilities.parallel_tool_calls.into();
+        input.supports_prompt_cache_key = model.capabilities.prompt_cache_key.into();
+        input.supports_chat_completions = model.capabilities.chat_completions.into();
+        input.interleaved_reasoning = model.capabilities.interleaved_reasoning.into();
+        input.max_tokens_parameter = model.capabilities.max_tokens_parameter.into();
+        input.expanded = false;
+        input.original = Some(OriginalModel::OpenAi(model.clone()));
+        input
+    }
+
+    fn from_anthropic(
+        model: &AnthropicCompatibleAvailableModel,
+        window: &mut Window,
+        cx: &mut Context<SettingsWindow>,
+    ) -> Self {
+        let mut input = Self::new(0, window, cx);
+        input.name.update(cx, |editor, cx| {
+            editor.set_text(model.name.as_str(), window, cx)
+        });
+        input.max_tokens.update(cx, |editor, cx| {
+            editor.set_text(model.max_tokens.to_string(), window, cx)
+        });
+        input.max_output_tokens.update(cx, |editor, cx| {
+            editor.set_text(
+                model.max_output_tokens.unwrap_or(32_000).to_string(),
+                window,
+                cx,
+            )
+        });
+        input.supports_tools = model.capabilities.tools.into();
+        input.supports_images = model.capabilities.images.into();
+        input.supports_thinking = model
+            .mode
+            .as_ref()
+            .is_some_and(|mode| !matches!(mode, settings::ModelMode::Default))
+            .into();
+        input.expanded = false;
+        input.original = Some(OriginalModel::Anthropic(model.clone()));
         input
     }
 }
@@ -671,8 +882,8 @@ fn open_llm_provider_form(
 ) {
     settings_window.llm_provider_form = Some(LlmProviderForm::new(kind, window, cx));
     settings_window.push_dynamic_sub_page(
-        format!("Add {}-Compatible Provider", kind.label()),
-        "Agent Configuration",
+        format!("添加 {} 兼容提供商", kind.label()),
+        "AI 设置",
         Some("llm_providers"),
         true,
         render_llm_provider_form_page,
@@ -703,27 +914,39 @@ fn render_llm_provider_form_page(
                 .gap_4()
                 .overflow_y_scroll()
                 .child(Label::new(match form.kind {
-                    CompatibleProviderKind::OpenAi => "此提供者将使用 OpenAI 兼容 API。",
+                    CompatibleProviderKind::OpenAi => "此提供商将使用 OpenAI 兼容 API。",
                     CompatibleProviderKind::Anthropic => {
-                        "此提供者将使用 Anthropic Messages 兼容 API。"
+                        "此提供商将使用 Anthropic Messages 兼容 API。"
                     }
                 }))
                 .child(Divider::horizontal().flex_shrink_0())
-                .child(render_form_field(
-                    "提供者名称",
-                    "用于标识此提供者的唯一名称。",
-                    &form.provider_name,
-                    cx,
-                ))
+                .when(form.editing_name.is_some(), |this| {
+                    this.child(
+                        Label::new("提供商名称是模型引用标识，编辑时不可更改。")
+                            .color(Color::Muted),
+                    )
+                })
+                .when(form.editing_name.is_none(), |this| {
+                    this.child(render_form_field(
+                        "提供商名称",
+                        "用于标识此提供商的唯一名称。",
+                        &form.provider_name,
+                        cx,
+                    ))
+                })
                 .child(render_form_field(
                     "API URL",
-                    "兼容 API 的基础 URL。",
+                    "兼容 API 的基础 URL。更换地址需输入新地址的密钥。",
                     &form.api_url,
                     cx,
                 ))
                 .child(render_form_field(
                     "API Key",
-                    "存储在系统密钥链中，而非 settings.json。",
+                    if form.editing_name.is_some() {
+                        "可选：仅更换密钥时填写；留空沿用当前地址的凭据。自动获取模型则需重新输入密钥。密钥存储在系统密钥链中。"
+                    } else {
+                        "存储在系统密钥链中，而非 settings.json。"
+                    },
                     &form.api_key,
                     cx,
                 ))
@@ -739,7 +962,10 @@ fn render_llm_provider_form_page(
                 .when_some(form.error.clone(), |this, error| {
                     this.child(render_form_error(error))
                 })
-                .child(render_form_actions(cx)),
+                .when_some(form.notice.clone(), |this, notice| {
+                    this.child(Label::new(notice).size(LabelSize::Small).color(Color::Success))
+                })
+                .child(render_form_actions(form.is_saving, cx)),
         )
         .into_any_element()
 }
@@ -805,7 +1031,7 @@ fn render_models_section(
         .gap_2()
         .child(
             Label::new(
-                "填写 API URL 和 API Key 后，优先自动获取模型；若接口不支持模型列表，再手动添加。",
+                "自动获取需输入 API Key（不会保存）；新模型会合并，已有模型的人工参数保持不变。接口未报告的能力需自行确认。",
             )
             .size(LabelSize::Small)
             .color(Color::Muted),
@@ -822,7 +1048,7 @@ fn render_models_section(
                                     .color(Color::Muted),
                             )
                             .label_size(LabelSize::Small)
-                            .disabled(form.is_fetching_models)
+                            .disabled(form.is_fetching_models || form.is_saving)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 fetch_llm_provider_models(this, window, cx);
                             })),
@@ -835,6 +1061,7 @@ fn render_models_section(
                                     .color(Color::Muted),
                             )
                             .label_size(LabelSize::Small)
+                            .disabled(form.is_saving)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if let Some(form) = this.llm_provider_form.as_mut() {
                                     let index = form.models.len();
@@ -846,7 +1073,7 @@ fn render_models_section(
             ),
         )
         .children(form.models.iter().enumerate().map(|(index, model)| {
-            render_model(form.kind, model, index, form.models.len(), window, cx)
+            render_model(form.kind, model, index, window, cx)
         }))
 }
 
@@ -858,7 +1085,7 @@ fn fetch_llm_provider_models(
     let Some(form) = settings_window.llm_provider_form.as_mut() else {
         return;
     };
-    if form.is_fetching_models {
+    if form.is_fetching_models || form.is_saving {
         return;
     }
 
@@ -867,13 +1094,14 @@ fn fetch_llm_provider_models(
     let api_url = form.api_url.read(cx).text(cx);
     let api_key = form.api_key.read(cx).text(cx);
     if api_url.trim().is_empty() || api_key.trim().is_empty() {
-        form.error = Some("请先填写 API URL 和 API Key".into());
+        form.error = Some("获取模型需要 API URL 和密钥；此操作不会保存密钥".into());
         cx.notify();
         return;
     }
 
     form.is_fetching_models = true;
     form.error = None;
+    form.notice = None;
     cx.notify();
 
     let api_url = api_url.trim().trim_end_matches('/').to_string();
@@ -946,15 +1174,17 @@ fn fetch_llm_provider_models(
                     form.error = Some("接口未返回可用模型，请手动添加".into());
                 }
                 Ok(models) => {
-                    form.models = models
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, model)| ModelInput::from_discovered(index, model, window, cx))
-                        .collect();
-                    form.error = None;
+                    let names = form.models.iter().map(|model| model.name.read(cx).text(cx));
+                    let models = new_discovered_models(names, models);
+                    let added = models.len();
+                    for model in models {
+                        form.models.push(ModelInput::from_discovered(form.models.len(), model, window, cx));
+                    }
+                    form.notice = Some(format!("获取完成：新增 {added} 个模型，已有模型及人工参数保持不变。请核对后保存。").into());
                 }
                 Err(error) => {
-                    form.error = Some(format!("自动获取失败：{error:#}").into());
+                    log::warn!("Compatible model discovery failed: {error:#}");
+                    form.error = Some("自动获取失败。请检查地址、密钥与模型列表接口，或手动添加模型。已有模型不会被删除。".into());
                 }
             }
             cx.notify();
@@ -962,6 +1192,17 @@ fn fetch_llm_provider_models(
         anyhow::Ok(())
     })
     .detach_and_log_err(cx);
+}
+
+fn new_discovered_models(
+    existing: impl IntoIterator<Item = String>,
+    discovered: Vec<DiscoveredModel>,
+) -> Vec<DiscoveredModel> {
+    let mut names: HashSet<String> = existing.into_iter().collect();
+    discovered
+        .into_iter()
+        .filter(|model| names.insert(model.name.clone()))
+        .collect()
 }
 
 struct DiscoveredModel {
@@ -977,7 +1218,6 @@ fn render_model(
     kind: CompatibleProviderKind,
     model: &ModelInput,
     index: usize,
-    model_count: usize,
     window: &mut Window,
     cx: &mut Context<SettingsWindow>,
 ) -> AnyElement {
@@ -989,54 +1229,88 @@ fn render_model(
         .border_dashed()
         .border_color(cx.theme().colors().border.opacity(0.6))
         .bg(cx.theme().colors().element_active.opacity(0.15))
-        .child(render_form_field(
-            "模型名称",
-            "模型在提供者 API 中的名称。",
-            &model.name,
-            cx,
-        ))
-        .when(matches!(kind, CompatibleProviderKind::OpenAi), |this| {
-            this.child(render_form_field(
-                "最大补全令牌数",
-                "OpenAI 兼容请求的最大补全令牌数。",
-                &model.max_completion_tokens,
-                cx,
-            ))
-        })
-        .child(render_form_field(
-            "最大输出令牌数",
-            "模型可以输出的最大令牌数。",
-            &model.max_output_tokens,
-            cx,
-        ))
-        .child(render_form_field(
-            "最大令牌数",
-            "模型上下文窗口大小。",
-            &model.max_tokens,
-            cx,
-        ))
-        .child(render_model_capabilities(kind, model, index, window, cx))
-        .when(model_count > 1, |this| {
-            this.child(
-                Button::new(("remove-model", index), "移除模型")
-                    .start_icon(
-                        Icon::new(IconName::Trash)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
+        .child(
+            h_flex()
+                .justify_between()
+                .child(Label::new(model.name.read(cx).text(cx)).color(Color::Muted))
+                .child(
+                    Button::new(
+                        ("expand-model", index),
+                        if model.expanded {
+                            "收起参数"
+                        } else {
+                            "编辑参数"
+                        },
                     )
-                    .label_size(LabelSize::Small)
-                    .style(ButtonStyle::Outlined)
-                    .full_width()
-                    .on_click(cx.listener(move |this, _, _window, cx| {
-                        if let Some(form) = this.llm_provider_form.as_mut()
-                            && index < form.models.len()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(model) = this
+                            .llm_provider_form
+                            .as_mut()
+                            .and_then(|form| form.models.get_mut(index))
                         {
-                            form.models.remove(index);
+                            model.expanded = !model.expanded;
                         }
                         cx.notify();
                     })),
-            )
+                ),
+        )
+        .when(model.expanded, |this| {
+            this.child(render_form_field(
+                "模型名称",
+                "模型在提供商 API 中的名称。",
+                &model.name,
+                cx,
+            ))
         })
+        .when(
+            model.expanded && matches!(kind, CompatibleProviderKind::OpenAi),
+            |this| {
+                this.child(render_form_field(
+                    "最大补全令牌数",
+                    "OpenAI 兼容请求的最大补全令牌数。",
+                    &model.max_completion_tokens,
+                    cx,
+                ))
+            },
+        )
+        .when(model.expanded, |this| {
+            this.child(render_form_field(
+                "最大输出令牌数",
+                "模型可以输出的最大令牌数。",
+                &model.max_output_tokens,
+                cx,
+            ))
+        })
+        .when(model.expanded, |this| {
+            this.child(render_form_field(
+                "最大令牌数",
+                "模型上下文窗口大小。",
+                &model.max_tokens,
+                cx,
+            ))
+        })
+        .when(model.expanded, |this| {
+            this.child(render_model_capabilities(kind, model, index, window, cx))
+        })
+        .child(
+            Button::new(("remove-model", index), "移除模型")
+                .start_icon(
+                    Icon::new(IconName::Trash)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .label_size(LabelSize::Small)
+                .style(ButtonStyle::Outlined)
+                .full_width()
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    if let Some(form) = this.llm_provider_form.as_mut()
+                        && index < form.models.len()
+                    {
+                        form.models.remove(index);
+                    }
+                    cx.notify();
+                })),
+        )
         .into_any_element()
 }
 
@@ -1052,7 +1326,7 @@ fn render_model_capabilities(
         .child(render_capability_checkbox(
             "supports-tools",
             index,
-            "Supports tools",
+            "支持工具调用",
             model.supports_tools,
             |model, state| model.supports_tools = state,
             cx,
@@ -1060,7 +1334,7 @@ fn render_model_capabilities(
         .child(render_capability_checkbox(
             "supports-images",
             index,
-            "Supports images",
+            "支持图片输入",
             model.supports_images,
             |model, state| model.supports_images = state,
             cx,
@@ -1069,7 +1343,7 @@ fn render_model_capabilities(
             this.child(render_capability_checkbox(
                 "supports-parallel-tool-calls",
                 index,
-                "Supports parallel_tool_calls",
+                "支持并行工具调用",
                 model.supports_parallel_tool_calls,
                 |model, state| model.supports_parallel_tool_calls = state,
                 cx,
@@ -1077,7 +1351,7 @@ fn render_model_capabilities(
             .child(render_capability_checkbox(
                 "supports-prompt-cache-key",
                 index,
-                "Supports prompt_cache_key",
+                "支持提示缓存键",
                 model.supports_prompt_cache_key,
                 |model, state| model.supports_prompt_cache_key = state,
                 cx,
@@ -1085,7 +1359,7 @@ fn render_model_capabilities(
             .child(render_capability_checkbox(
                 "supports-chat-completions",
                 index,
-                "Supports /chat/completions",
+                "使用 /chat/completions 接口",
                 model.supports_chat_completions,
                 |model, state| model.supports_chat_completions = state,
                 cx,
@@ -1094,7 +1368,7 @@ fn render_model_capabilities(
                 this.child(render_capability_checkbox(
                     "max-tokens-parameter",
                     index,
-                    "Uses max_tokens for output limit",
+                    "使用 max_tokens 限制输出",
                     model.max_tokens_parameter,
                     |model, state| model.max_tokens_parameter = state,
                     cx,
@@ -1103,7 +1377,7 @@ fn render_model_capabilities(
             .child(render_capability_checkbox(
                 "supports-thinking",
                 index,
-                "Supports thinking",
+                "支持推理模式",
                 model.supports_thinking,
                 |model, state| model.supports_thinking = state,
                 cx,
@@ -1119,7 +1393,7 @@ fn render_model_capabilities(
                     this.child(render_capability_checkbox(
                         "interleaved-reasoning",
                         index,
-                        "Preserves thinking in chat history",
+                        "在聊天历史中保留推理内容",
                         model.interleaved_reasoning,
                         |model, state| model.interleaved_reasoning = state,
                         cx,
@@ -1208,22 +1482,22 @@ fn render_form_error(error: SharedString) -> impl IntoElement {
         .child(Label::new(error).size(LabelSize::Small).color(Color::Error))
 }
 
-fn render_form_actions(cx: &mut Context<SettingsWindow>) -> impl IntoElement {
+fn render_form_actions(is_saving: bool, cx: &mut Context<SettingsWindow>) -> impl IntoElement {
     h_flex()
         .w_full()
         .gap_1()
         .justify_end()
         .child(
-            Button::new("llm-provider-form-cancel", "取消").on_click(cx.listener(
-                |this, _, window, cx| {
-                    this.llm_provider_form = None;
+            Button::new("llm-provider-form-cancel", "取消")
+                .disabled(is_saving)
+                .on_click(cx.listener(|this, _, window, cx| {
                     this.pop_sub_page(window, cx);
-                },
-            )),
+                })),
         )
         .child(
             Button::new("llm-provider-form-save", "保存提供商")
                 .style(ButtonStyle::Filled)
+                .disabled(is_saving)
                 .on_click(cx.listener(|this, _, window, cx| {
                     save_llm_provider_form(this, window, cx);
                 })),
@@ -1236,6 +1510,8 @@ struct LlmProviderFormValues {
     api_url: String,
     api_key: String,
     models: Vec<ModelValues>,
+    editing_name: Option<String>,
+    original_api_url: Option<String>,
 }
 
 struct ModelValues {
@@ -1252,6 +1528,7 @@ struct ModelValues {
     supports_thinking: bool,
     interleaved_reasoning: bool,
     max_tokens_parameter: bool,
+    original: Option<OriginalModel>,
 }
 
 enum ParsedModels {
@@ -1268,8 +1545,13 @@ fn save_llm_provider_form(
         let Some(form) = settings_window.llm_provider_form.as_ref() else {
             return;
         };
+        if form.is_saving {
+            return;
+        }
         LlmProviderFormValues {
             kind: form.kind,
+            editing_name: form.editing_name.clone(),
+            original_api_url: form.original_api_url.clone(),
             provider_name: form.provider_name.read(cx).text(cx),
             api_url: form.api_url.read(cx).text(cx),
             api_key: form.api_key.read(cx).text(cx),
@@ -1290,6 +1572,7 @@ fn save_llm_provider_form(
                     supports_thinking: model.supports_thinking.selected(),
                     interleaved_reasoning: model.interleaved_reasoning.selected(),
                     max_tokens_parameter: model.max_tokens_parameter.selected(),
+                    original: model.original.clone(),
                 })
                 .collect(),
         }
@@ -1306,6 +1589,16 @@ fn save_llm_provider_form(
         }
     };
 
+    if let Some(form) = settings_window.llm_provider_form.as_mut() {
+        form.is_saving = true;
+        form.error = None;
+        form.notice = None;
+    }
+    cx.notify();
+    let form_id = settings_window
+        .llm_provider_form
+        .as_ref()
+        .map(|form| form.id);
     let fs = <dyn fs::Fs>::global(cx);
     cx.spawn_in(window, async move |this, cx| {
         let result = async {
@@ -1315,30 +1608,32 @@ fn save_llm_provider_form(
                     let language_models = settings.language_models.get_or_insert_default();
                     match models {
                         ParsedModels::OpenAi(available_models) => {
-                            language_models
-                                .openai_compatible
-                                .get_or_insert_default()
-                                .insert(
-                                    Arc::from(provider_name.as_str()),
-                                    OpenAiCompatibleSettingsContent {
-                                        api_url: api_url.clone(),
-                                        available_models,
-                                        custom_headers: None,
-                                    },
-                                );
+                            let providers =
+                                language_models.openai_compatible.get_or_insert_default();
+                            providers.insert(
+                                Arc::from(provider_name.as_str()),
+                                OpenAiCompatibleSettingsContent {
+                                    api_url: api_url.clone(),
+                                    available_models,
+                                    custom_headers: providers
+                                        .get(provider_name.as_str())
+                                        .and_then(|previous| previous.custom_headers.clone()),
+                                },
+                            );
                         }
                         ParsedModels::Anthropic(available_models) => {
-                            language_models
-                                .anthropic_compatible
-                                .get_or_insert_default()
-                                .insert(
-                                    Arc::from(provider_name.as_str()),
-                                    AnthropicCompatibleSettingsContent {
-                                        api_url: api_url.clone(),
-                                        available_models,
-                                        custom_headers: None,
-                                    },
-                                );
+                            let providers =
+                                language_models.anthropic_compatible.get_or_insert_default();
+                            providers.insert(
+                                Arc::from(provider_name.as_str()),
+                                AnthropicCompatibleSettingsContent {
+                                    api_url: api_url.clone(),
+                                    available_models,
+                                    custom_headers: providers
+                                        .get(provider_name.as_str())
+                                        .and_then(|previous| previous.custom_headers.clone()),
+                                },
+                            );
                         }
                     }
                 })
@@ -1346,21 +1641,29 @@ fn save_llm_provider_form(
 
             settings_update
                 .await
-                .map_err(|_| anyhow::anyhow!("Settings update was canceled"))??;
+                .map_err(|_| anyhow::anyhow!("设置写入已取消"))??;
 
-            let set_api_key = cx.update(|_window, cx| {
-                let provider = LanguageModelRegistry::read_global(cx)
-                    .provider(&provider_id)
-                    .ok_or_else(|| anyhow::anyhow!("Provider was not registered"))?;
-                anyhow::Ok(provider.set_api_key(Some(api_key), cx))
-            })??;
-            set_api_key.await?;
+            if !api_key.is_empty() {
+                let set_api_key = cx.update(|_window, cx| {
+                    let provider = LanguageModelRegistry::read_global(cx)
+                        .provider(&provider_id)
+                        .ok_or_else(|| anyhow::anyhow!("提供商尚未注册"))?;
+                    anyhow::Ok(provider.set_api_key(Some(api_key), cx))
+                })??;
+                set_api_key.await?;
+            }
 
             cx.update(|window, cx| {
                 this.update(cx, |this, cx| {
                     this.provider_configuration_views.remove(&provider_id);
-                    this.llm_provider_form = None;
-                    this.pop_sub_page(window, cx);
+                    if this
+                        .llm_provider_form
+                        .as_ref()
+                        .is_some_and(|form| Some(form.id) == form_id)
+                    {
+                        this.llm_provider_form = None;
+                        this.pop_sub_page(window, cx);
+                    }
                 })
             })??;
 
@@ -1370,10 +1673,15 @@ fn save_llm_provider_form(
 
         if let Err(error) = result {
             this.update(cx, |this, cx| {
-                if let Some(form) = this.llm_provider_form.as_mut() {
+                if let Some(form) = this
+                    .llm_provider_form
+                    .as_mut()
+                    .filter(|form| Some(form.id) == form_id)
+                {
+                    form.is_saving = false;
                     form.error = Some(error.to_string().into());
+                    cx.notify();
                 }
-                cx.notify();
             })?;
         }
 
@@ -1386,31 +1694,42 @@ fn validate_llm_provider_form(
     values: &LlmProviderFormValues,
     cx: &App,
 ) -> Result<(String, String, String, ParsedModels), SharedString> {
-    let provider_name = values.provider_name.clone();
+    let provider_name = values.provider_name.trim().to_string();
     if provider_name.is_empty() {
-        return Err("提供者名称不能为空".into());
+        return Err("提供商名称不能为空".into());
     }
 
-    if LanguageModelRegistry::read_global(cx)
-        .providers()
-        .iter()
-        .any(|provider| {
-            provider.id().0.as_ref() == provider_name.as_str()
-                || provider.name().0.as_ref() == provider_name.as_str()
-        })
+    if values
+        .editing_name
+        .as_deref()
+        .is_some_and(|name| name != provider_name)
     {
-        return Err("提供者名称已被其他提供者占用".into());
+        return Err("编辑现有提供商时不能更改名称".into());
+    }
+    if values.editing_name.is_none()
+        && LanguageModelRegistry::read_global(cx)
+            .providers()
+            .iter()
+            .any(|provider| {
+                provider.id().0.as_ref() == provider_name.as_str()
+                    || provider.name().0.as_ref() == provider_name.as_str()
+            })
+    {
+        return Err("提供商名称已被占用".into());
     }
 
-    let api_url = values.api_url.clone();
+    let api_url = values.api_url.trim().to_string();
     if api_url.is_empty() {
         return Err("API URL 不能为空".into());
     }
 
-    let api_key = values.api_key.clone();
-    if api_key.is_empty() {
-        return Err("API Key cannot be empty".into());
-    }
+    let api_key = values.api_key.trim().to_string();
+    validate_credential_change(
+        values.editing_name.as_deref(),
+        values.original_api_url.as_deref(),
+        &api_url,
+        &api_key,
+    )?;
 
     if values.models.is_empty() {
         return Err("请先自动获取或手动添加至少一个模型".into());
@@ -1449,24 +1768,58 @@ fn validate_llm_provider_form(
     Ok((provider_name, api_url, api_key, models))
 }
 
+fn validate_credential_change(
+    editing_name: Option<&str>,
+    original_api_url: Option<&str>,
+    api_url: &str,
+    api_key: &str,
+) -> Result<(), SharedString> {
+    if api_key.is_empty() && editing_name.is_none() {
+        return Err("API 密钥不能为空".into());
+    }
+    if api_key.is_empty() && original_api_url != Some(api_url) {
+        return Err("修改 API URL 时需要提供新地址的 API 密钥".into());
+    }
+    Ok(())
+}
+
 fn parse_model_name(model: &ModelValues) -> Result<String, SharedString> {
-    if model.name.is_empty() {
+    let name = model.name.trim();
+    if name.is_empty() {
         return Err("模型名称不能为空".into());
     }
-    Ok(model.name.clone())
+    Ok(name.to_string())
 }
 
 fn parse_open_ai_model(
     model: &ModelValues,
 ) -> Result<OpenAiCompatibleAvailableModel, SharedString> {
+    let original = match &model.original {
+        Some(OriginalModel::OpenAi(original)) if original.name == model.name.trim() => {
+            Some(original)
+        }
+        _ => None,
+    };
+    let max_output_tokens = parse_u64_field(&model.max_output_tokens, "最大输出令牌数")?;
+    let max_completion_tokens = parse_u64_field(&model.max_completion_tokens, "最大补全令牌数")?;
     Ok(OpenAiCompatibleAvailableModel {
         name: parse_model_name(model)?,
-        display_name: None,
-        max_completion_tokens: Some(parse_u64_field(
-            &model.max_completion_tokens,
-            "Max Completion Tokens",
-        )?),
-        max_output_tokens: Some(parse_u64_field(&model.max_output_tokens, "最大输出令牌数")?),
+        display_name: original.and_then(|original| original.display_name.clone()),
+        max_completion_tokens: if original
+            .is_some_and(|original| original.max_completion_tokens.is_none())
+            && max_completion_tokens == 200_000
+        {
+            None
+        } else {
+            Some(max_completion_tokens)
+        },
+        max_output_tokens: if original.is_some_and(|original| original.max_output_tokens.is_none())
+            && max_output_tokens == 32_000
+        {
+            None
+        } else {
+            Some(max_output_tokens)
+        },
         max_tokens: parse_u64_field(&model.max_tokens, "最大令牌数")?,
         reasoning_effort: model.supports_thinking.then_some(model.reasoning_effort),
         capabilities: OpenAiCompatibleModelCapabilities {
@@ -1486,19 +1839,39 @@ fn parse_open_ai_model(
 fn parse_anthropic_model(
     model: &ModelValues,
 ) -> Result<AnthropicCompatibleAvailableModel, SharedString> {
+    let original = match &model.original {
+        Some(OriginalModel::Anthropic(original)) if original.name == model.name.trim() => {
+            Some(original)
+        }
+        _ => None,
+    };
+    let max_output_tokens = parse_u64_field(&model.max_output_tokens, "最大输出令牌数")?;
+    let mode = original.and_then(|original| original.mode);
     Ok(AnthropicCompatibleAvailableModel {
         name: parse_model_name(model)?,
-        display_name: None,
+        display_name: original.and_then(|original| original.display_name.clone()),
         max_tokens: parse_u64_field(&model.max_tokens, "最大令牌数")?,
-        tool_override: None,
-        max_output_tokens: Some(parse_u64_field(&model.max_output_tokens, "最大输出令牌数")?),
-        default_temperature: None,
-        extra_beta_headers: Vec::new(),
-        mode: None,
+        tool_override: original.and_then(|original| original.tool_override.clone()),
+        max_output_tokens: if original.is_some_and(|original| original.max_output_tokens.is_none())
+            && max_output_tokens == 32_000
+        {
+            None
+        } else {
+            Some(max_output_tokens)
+        },
+        default_temperature: original.and_then(|original| original.default_temperature),
+        extra_beta_headers: original
+            .map_or_else(Vec::new, |original| original.extra_beta_headers.clone()),
+        mode: if model.supports_thinking {
+            mode.filter(|mode| !matches!(mode, settings::ModelMode::Default))
+                .or(Some(settings::ModelMode::Adaptive))
+        } else {
+            mode.filter(|mode| matches!(mode, settings::ModelMode::Default))
+        },
         capabilities: AnthropicCompatibleModelCapabilities {
             tools: model.supports_tools,
             images: model.supports_images,
-            prompt_caching: false,
+            prompt_caching: original.is_some_and(|original| original.capabilities.prompt_caching),
         },
     })
 }
@@ -1506,7 +1879,7 @@ fn parse_anthropic_model(
 fn parse_u64_field(value: &str, name: &str) -> Result<u64, SharedString> {
     value
         .parse::<u64>()
-        .map_err(|_| format!("{name} must be a number").into())
+        .map_err(|_| format!("{name} 必须是数字").into())
 }
 
 #[cfg(test)]
@@ -1516,6 +1889,60 @@ mod tests {
     use settings::SettingsStore;
 
     use super::*;
+
+    #[test]
+    fn editing_credential_policy_requires_new_key_only_for_new_url() {
+        assert!(validate_credential_change(None, None, "https://example.com/v1", "").is_err());
+        assert!(
+            validate_credential_change(
+                Some("my-provider"),
+                Some("https://example.com/v1"),
+                "https://example.com/v1",
+                ""
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_credential_change(
+                Some("my-provider"),
+                Some("https://example.com/v1"),
+                "https://other.example.com/v1",
+                ""
+            )
+            .is_err()
+        );
+        assert!(
+            validate_credential_change(
+                Some("my-provider"),
+                Some("https://example.com/v1"),
+                "https://other.example.com/v1",
+                "new-key"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn discovery_preserves_existing_models_and_deduplicates_results() {
+        let models = ["existing", "new", "new"]
+            .into_iter()
+            .map(|name| DiscoveredModel {
+                name: name.to_string(),
+                max_tokens: 200_000,
+                max_output_tokens: 32_000,
+                supports_tools: true,
+                supports_images: false,
+                supports_thinking: false,
+            })
+            .collect();
+        let new = new_discovered_models(["existing".to_string()], models);
+        assert_eq!(
+            new.iter()
+                .map(|model| model.name.as_str())
+                .collect::<Vec<_>>(),
+            ["new"]
+        );
+    }
 
     struct YoungAccountProviderRow;
 
