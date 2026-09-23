@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
+use gpui::{AppContext as _, AsyncApp};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use smol::process::Stdio;
@@ -61,23 +62,32 @@ pub fn list_managed_ssh_keys() -> Result<Vec<ManagedSshKey>> {
     Ok(load_or_create_manifest()?.keys)
 }
 
-pub fn apply_managed_identity(options: &mut SshConnectionOptions) -> Result<Option<ManagedSshKey>> {
-    let manifest = load_or_create_manifest()?;
+/// Adds the stored Zed identity for this target to `options`, if one exists.
+///
+/// The manifest lookup touches the filesystem, so it runs on the background
+/// executor. This is the first thing every SSH connection does, and a blocking
+/// read on GPUI's foreground executor would delay the connection for a whole
+/// round trip.
+pub async fn apply_managed_identity(
+    options: &mut SshConnectionOptions,
+    cx: &AsyncApp,
+) -> Result<Option<ManagedSshKey>> {
     let host = normalize_host(&options.host.to_string());
     let port = options.port.unwrap_or(22);
-    let Some(key) = manifest.keys.into_iter().find(|key| {
-        key.deployment_state == ManagedSshKeyDeploymentState::Verified
-            && key.host == host
-            && key.port == port
-            && key.requested_username == options.username
-    }) else {
+    let username = options.username.clone();
+    let identity = cx
+        .background_spawn(async move {
+            load_managed_identity(
+                &managed_ssh_key_directory(),
+                &host,
+                port,
+                username.as_deref(),
+            )
+        })
+        .await?;
+    let Some((key, private_key_path)) = identity else {
         return Ok(None);
     };
-
-    let private_key_path = managed_ssh_key_directory().join(&key.private_key_file);
-    if !private_key_path.is_file() {
-        return Ok(None);
-    }
 
     let arguments = options.args.get_or_insert_default();
     if !contains_identity_file(arguments, &private_key_path) {
@@ -91,11 +101,51 @@ pub fn apply_managed_identity(options: &mut SshConnectionOptions) -> Result<Opti
     Ok(Some(key))
 }
 
+fn load_managed_identity(
+    directory: &Path,
+    host: &str,
+    port: u16,
+    username: Option<&str>,
+) -> Result<Option<(ManagedSshKey, PathBuf)>> {
+    let manifest = load_or_create_manifest_in(directory)?;
+    let Some(key) = manifest.keys.into_iter().find(|key| {
+        key.deployment_state == ManagedSshKeyDeploymentState::Verified
+            && key.host == host
+            && key.port == port
+            && key.requested_username.as_deref() == username
+    }) else {
+        return Ok(None);
+    };
+
+    let private_key_path = directory.join(&key.private_key_file);
+    if !private_key_path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some((key, private_key_path)))
+}
+
+/// Generates and stores a new identity for this target.
+///
+/// Key generation spawns `ssh-keygen` and rewrites the manifest, so the whole
+/// body runs on the background executor.
 pub async fn generate_managed_ssh_key(
     options: &SshConnectionOptions,
     remote_username: String,
+    cx: &AsyncApp,
 ) -> Result<GeneratedManagedSshKey> {
-    let mut manifest = load_or_create_manifest()?;
+    let options = options.clone();
+    cx.background_spawn(
+        async move { generate_managed_ssh_key_blocking(options, remote_username).await },
+    )
+    .await
+}
+
+async fn generate_managed_ssh_key_blocking(
+    options: SshConnectionOptions,
+    remote_username: String,
+) -> Result<GeneratedManagedSshKey> {
+    let directory = managed_ssh_key_directory();
+    let mut manifest = load_or_create_manifest_in(&directory)?;
     let host = normalize_host(&options.host.to_string());
     let port = options.port.unwrap_or(22);
 
@@ -103,20 +153,17 @@ pub async fn generate_managed_ssh_key(
         key.host == host
             && key.port == port
             && key.requested_username == options.username
-            && managed_ssh_key_directory()
-                .join(&key.private_key_file)
-                .is_file()
+            && directory.join(&key.private_key_file).is_file()
     }) {
         return Ok(GeneratedManagedSshKey {
-            private_key_path: managed_ssh_key_directory().join(&key.private_key_file),
+            private_key_path: directory.join(&key.private_key_file),
             record: key.clone(),
         });
     }
 
-    let directory = managed_ssh_key_directory();
     fs::create_dir_all(&directory)
         .with_context(|| format!("创建 Zed SSH 密钥目录失败：{}", directory.display()))?;
-    restrict_directory_permissions(&directory)?;
+    enforce_restricted_permissions(&directory, RestrictedPath::Directory)?;
 
     let target_hash = short_hash(&format!(
         "{}\0{}\0{}",
@@ -174,7 +221,7 @@ pub async fn generate_managed_ssh_key(
         cleanup_key_pair(&private_key_path);
         return Err(error);
     }
-    restrict_private_key_permissions(&private_key_path)?;
+    enforce_restricted_permissions(&private_key_path, RestrictedPath::File)?;
 
     let record = ManagedSshKey {
         key_id,
@@ -191,7 +238,7 @@ pub async fn generate_managed_ssh_key(
         deployment_state: ManagedSshKeyDeploymentState::Pending,
     };
     manifest.keys.push(record.clone());
-    save_manifest(&manifest)?;
+    save_manifest_in(&directory, &manifest)?;
 
     Ok(GeneratedManagedSshKey {
         record,
@@ -199,26 +246,42 @@ pub async fn generate_managed_ssh_key(
     })
 }
 
-pub fn mark_managed_ssh_key_verified(key_id: &str) -> Result<()> {
-    let mut manifest = load_or_create_manifest()?;
-    let Some(key) = manifest.keys.iter_mut().find(|key| key.key_id == key_id) else {
-        anyhow::bail!("找不到刚刚创建的 Zed SSH 密钥记录");
-    };
-    key.deployment_state = ManagedSshKeyDeploymentState::Verified;
-    key.last_used_at = Some(utc_timestamp());
-    save_manifest(&manifest)
-}
-
-pub fn mark_managed_ssh_key_used(key_id: &str) -> Result<()> {
-    let mut manifest = load_or_create_manifest()?;
-    if let Some(key) = manifest.keys.iter_mut().find(|key| key.key_id == key_id) {
+pub async fn mark_managed_ssh_key_verified(key_id: &str, cx: &AsyncApp) -> Result<()> {
+    let key_id = key_id.to_owned();
+    cx.background_spawn(async move {
+        let directory = managed_ssh_key_directory();
+        let mut manifest = load_or_create_manifest_in(&directory)?;
+        let Some(key) = manifest.keys.iter_mut().find(|key| key.key_id == key_id) else {
+            anyhow::bail!("找不到刚刚创建的 Zed SSH 密钥记录");
+        };
+        key.deployment_state = ManagedSshKeyDeploymentState::Verified;
         key.last_used_at = Some(utc_timestamp());
-        save_manifest(&manifest)?;
-    }
-    Ok(())
+        save_manifest_in(&directory, &manifest)
+    })
+    .await
 }
 
-pub async fn revoke_and_delete_managed_ssh_key(key_id: &str) -> Result<()> {
+pub async fn mark_managed_ssh_key_used(key_id: &str, cx: &AsyncApp) -> Result<()> {
+    let key_id = key_id.to_owned();
+    cx.background_spawn(async move {
+        let directory = managed_ssh_key_directory();
+        let mut manifest = load_or_create_manifest_in(&directory)?;
+        if let Some(key) = manifest.keys.iter_mut().find(|key| key.key_id == key_id) {
+            key.last_used_at = Some(utc_timestamp());
+            save_manifest_in(&directory, &manifest)?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+pub async fn revoke_and_delete_managed_ssh_key(key_id: &str, cx: &AsyncApp) -> Result<()> {
+    let key_id = key_id.to_owned();
+    cx.background_spawn(async move { revoke_and_delete_managed_ssh_key_blocking(&key_id).await })
+        .await
+}
+
+async fn revoke_and_delete_managed_ssh_key_blocking(key_id: &str) -> Result<()> {
     let manifest = load_or_create_manifest()?;
     let key = manifest
         .keys
@@ -269,26 +332,40 @@ pub async fn revoke_and_delete_managed_ssh_key(key_id: &str) -> Result<()> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    delete_local_managed_ssh_key(key_id)
+    delete_local_managed_ssh_key_blocking(key_id)
 }
 
-pub fn delete_local_managed_ssh_key(key_id: &str) -> Result<()> {
-    let mut manifest = load_or_create_manifest()?;
+pub async fn delete_local_managed_ssh_key(key_id: &str, cx: &AsyncApp) -> Result<()> {
+    let key_id = key_id.to_owned();
+    cx.background_spawn(async move { delete_local_managed_ssh_key_blocking(&key_id) })
+        .await
+}
+
+fn delete_local_managed_ssh_key_blocking(key_id: &str) -> Result<()> {
+    let directory = managed_ssh_key_directory();
+    let mut manifest = load_or_create_manifest_in(&directory)?;
     let Some(index) = manifest.keys.iter().position(|key| key.key_id == key_id) else {
         return Ok(());
     };
     let key = manifest.keys.remove(index);
-    let private_key_path = managed_ssh_key_directory().join(key.private_key_file);
+    let private_key_path = directory.join(key.private_key_file);
     remove_file_if_present(&private_key_path)?;
     remove_file_if_present(&public_key_path(&private_key_path))?;
-    save_manifest(&manifest)
+    save_manifest_in(&directory, &manifest)
 }
 
 fn load_or_create_manifest() -> Result<ManagedSshKeyManifest> {
-    let directory = managed_ssh_key_directory();
+    load_or_create_manifest_in(&managed_ssh_key_directory())
+}
+
+/// Reads `directory`'s key manifest, creating it when it does not exist yet.
+///
+/// Reading must not enforce permissions again: on Windows that would run a
+/// blocking `icacls` process, and this runs on every SSH connection. Existing
+/// key material is only repaired where that is free, see [`repair_read_permissions`].
+fn load_or_create_manifest_in(directory: &Path) -> Result<ManagedSshKeyManifest> {
     let path = directory.join(MANIFEST_FILE_NAME);
     if path.is_file() {
-        restrict_directory_permissions(&directory)?;
         let manifest: ManagedSshKeyManifest = serde_json::from_slice(
             &fs::read(&path).with_context(|| format!("读取 {} 失败", path.display()))?,
         )
@@ -296,38 +373,31 @@ fn load_or_create_manifest() -> Result<ManagedSshKeyManifest> {
         if manifest.version != MANIFEST_VERSION {
             anyhow::bail!("不支持的 Zed SSH 密钥清单版本：{}", manifest.version);
         }
-        restrict_private_key_permissions(&path)?;
-        for key in &manifest.keys {
-            let private_key_path = directory.join(&key.private_key_file);
-            if private_key_path.is_file() {
-                restrict_private_key_permissions(&private_key_path)?;
-            }
-        }
+        repair_read_permissions(directory, &path, &manifest.keys)?;
         return Ok(manifest);
     }
 
-    fs::create_dir_all(&directory).with_context(|| format!("创建 {} 失败", directory.display()))?;
-    restrict_directory_permissions(&directory)?;
+    fs::create_dir_all(directory).with_context(|| format!("创建 {} 失败", directory.display()))?;
+    enforce_restricted_permissions(directory, RestrictedPath::Directory)?;
     let manifest = ManagedSshKeyManifest {
         version: MANIFEST_VERSION,
         client_id: Uuid::new_v4().to_string(),
         client_name: local_client_name(),
         keys: Vec::new(),
     };
-    save_manifest(&manifest)?;
+    save_manifest_in(directory, &manifest)?;
     Ok(manifest)
 }
 
-fn save_manifest(manifest: &ManagedSshKeyManifest) -> Result<()> {
-    let directory = managed_ssh_key_directory();
-    fs::create_dir_all(&directory)?;
-    restrict_directory_permissions(&directory)?;
+fn save_manifest_in(directory: &Path, manifest: &ManagedSshKeyManifest) -> Result<()> {
+    fs::create_dir_all(directory)?;
+    enforce_restricted_permissions(directory, RestrictedPath::Directory)?;
     let path = directory.join(MANIFEST_FILE_NAME);
     let temporary_path = directory.join(format!(".{MANIFEST_FILE_NAME}-{}.tmp", Uuid::new_v4()));
     let bytes = serde_json::to_vec_pretty(manifest)?;
     fs::write(&temporary_path, bytes)
         .with_context(|| format!("写入 {} 失败", temporary_path.display()))?;
-    restrict_private_key_permissions(&temporary_path)?;
+    enforce_restricted_permissions(&temporary_path, RestrictedPath::File)?;
     replace_manifest_file(&temporary_path, &path)
         .with_context(|| format!("替换 {} 失败", path.display()))?;
     Ok(())
@@ -464,6 +534,88 @@ fn utc_timestamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+#[derive(Clone, Copy)]
+enum RestrictedPath {
+    Directory,
+    File,
+}
+
+/// Applies the permissions required for Zed-owned key material.
+///
+/// Only call this while creating or rewriting the key directory, the manifest
+/// or a private key. On Windows it runs `icacls`, a blocking process spawn, so
+/// it must stay off GPUI's foreground executor.
+fn enforce_restricted_permissions(path: &Path, kind: RestrictedPath) -> Result<()> {
+    #[cfg(test)]
+    TEST_PERMISSION_ENFORCEMENTS.with(|count| count.set(count.get() + 1));
+    match kind {
+        RestrictedPath::Directory => restrict_directory_permissions(path),
+        RestrictedPath::File => restrict_private_key_permissions(path),
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Counts permission enforcement on the current thread, so the regression
+    /// test below can prove that reading the manifest does not enforce again.
+    static TEST_PERMISSION_ENFORCEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn permission_enforcement_count() -> usize {
+    TEST_PERMISSION_ENFORCEMENTS.with(std::cell::Cell::get)
+}
+
+/// Restores the permissions of existing key material without spawning a process.
+///
+/// Unix re-applies the mode only when it drifted, which costs one `stat` per
+/// path. Verifying a Windows ACL would need another `icacls` process, so Windows
+/// permissions are enforced where the key material is created or rewritten, in
+/// [`enforce_restricted_permissions`].
+#[cfg(unix)]
+fn repair_read_permissions(
+    directory: &Path,
+    manifest_path: &Path,
+    keys: &[ManagedSshKey],
+) -> Result<()> {
+    repair_unix_mode(directory, 0o700)?;
+    repair_unix_mode(manifest_path, 0o600)?;
+    for key in keys {
+        let private_key_path = directory.join(&key.private_key_file);
+        if private_key_path.is_file() {
+            repair_unix_mode(&private_key_path, 0o600)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn repair_read_permissions(
+    _directory: &Path,
+    _manifest_path: &Path,
+    _keys: &[ManagedSshKey],
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn repair_unix_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("读取 {} 权限失败", path.display()));
+        }
+    };
+    if metadata.permissions().mode() & 0o777 != mode {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .with_context(|| format!("设置 {} 权限失败", path.display()))?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn restrict_directory_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -545,6 +697,101 @@ mod tests {
         assert_eq!(
             public_key_identity("ssh-ed25519 AAAA first").unwrap(),
             public_key_identity("ssh-ed25519 AAAA second").unwrap()
+        );
+    }
+
+    fn test_key(key_id: &str, deployment_state: ManagedSshKeyDeploymentState) -> ManagedSshKey {
+        ManagedSshKey {
+            key_id: key_id.to_string(),
+            host: "example.com".to_string(),
+            port: 22,
+            requested_username: Some("dev".to_string()),
+            connection_args: Vec::new(),
+            ssh_destination: String::new(),
+            remote_username: "dev".to_string(),
+            private_key_file: "zed-key".to_string(),
+            public_key: "ssh-ed25519 AAAA".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_used_at: None,
+            deployment_state,
+        }
+    }
+
+    #[test]
+    fn reading_the_manifest_does_not_enforce_permissions_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path();
+        let created = load_or_create_manifest_in(directory).unwrap();
+
+        let enforced = permission_enforcement_count();
+        let reread = load_or_create_manifest_in(directory).unwrap();
+        assert_eq!(permission_enforcement_count(), enforced);
+        assert_eq!(reread.client_id, created.client_id);
+    }
+
+    #[test]
+    fn only_verified_keys_with_an_existing_private_key_are_reused() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path();
+        let mut manifest = load_or_create_manifest_in(directory).unwrap();
+        manifest
+            .keys
+            .push(test_key("pending", ManagedSshKeyDeploymentState::Pending));
+        manifest
+            .keys
+            .push(test_key("verified", ManagedSshKeyDeploymentState::Verified));
+        save_manifest_in(directory, &manifest).unwrap();
+
+        assert!(
+            load_managed_identity(directory, "example.com", 22, Some("dev"))
+                .unwrap()
+                .is_none()
+        );
+
+        fs::write(directory.join("zed-key"), b"private key").unwrap();
+        let (key, private_key_path) =
+            load_managed_identity(directory, "example.com", 22, Some("dev"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(key.key_id, "verified");
+        assert_eq!(private_key_path, directory.join("zed-key"));
+        assert!(
+            load_managed_identity(directory, "example.com", 2222, Some("dev"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            load_managed_identity(directory, "example.com", 22, Some("other"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            load_managed_identity(directory, "other.example", 22, Some("dev"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reading_a_loose_manifest_restores_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path();
+        load_or_create_manifest_in(directory).unwrap();
+        let manifest_path = directory.join(MANIFEST_FILE_NAME);
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        load_or_create_manifest_in(directory).unwrap();
+        assert_eq!(
+            fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&manifest_path).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 }

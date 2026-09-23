@@ -3313,8 +3313,8 @@ impl RemoteServerProjects {
                 )
                 .await?;
             match answer {
-                1 => remote::revoke_and_delete_managed_ssh_key(&key.key_id).await?,
-                2 => remote::delete_local_managed_ssh_key(&key.key_id)?,
+                1 => remote::revoke_and_delete_managed_ssh_key(&key.key_id, cx).await?,
+                2 => remote::delete_local_managed_ssh_key(&key.key_id, cx).await?,
                 _ => return Ok(()),
             }
             if let Some(workspace) = workspace.upgrade() {

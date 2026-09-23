@@ -789,7 +789,8 @@ impl SshRemoteConnection {
 
         let destination = connection_options.ssh_destination();
         let mut connection_options = connection_options;
-        let managed_key = crate::managed_ssh_keys::apply_managed_identity(&mut connection_options)?;
+        let managed_key =
+            crate::managed_ssh_keys::apply_managed_identity(&mut connection_options, cx).await?;
 
         let temp_dir = tempfile::Builder::new()
             .prefix("zed-ssh-session")
@@ -958,7 +959,7 @@ impl SshRemoteConnection {
         log::info!("Remote OS version discovered: {:?}", ssh_os_version);
 
         if let Some(managed_key) = managed_key {
-            crate::managed_ssh_keys::mark_managed_ssh_key_used(&managed_key.key_id)?;
+            crate::managed_ssh_keys::mark_managed_ssh_key_used(&managed_key.key_id, cx).await?;
         } else if delegate.should_create_managed_ssh_key() {
             delegate.set_status(Some("正在创建并部署 Zed 专属 SSH 密钥"), cx);
             socket
@@ -1967,6 +1968,7 @@ impl SshSocket {
         let generated = crate::managed_ssh_keys::generate_managed_ssh_key(
             &self.connection_options,
             remote_username,
+            cx,
         )
         .await?;
         let install_script = "umask 077; mkdir -p \"$HOME/.ssh\"; file=\"$HOME/.ssh/authorized_keys\"; lock=\"$HOME/.ssh/.zed-authorized-keys.lock\"; count=0; while ! mkdir \"$lock\" 2>/dev/null; do count=$((count+1)); [ \"$count\" -ge 100 ] && exit 73; sleep 0.1; done; trap 'rmdir \"$lock\"' EXIT HUP INT TERM; touch \"$file\"; chmod 700 \"$HOME/.ssh\"; chmod 600 \"$file\"; key=$1; set -- $key; type=$1; blob=$2; if ! awk -v type=\"$type\" -v blob=\"$blob\" '$1 == type && $2 == blob { found=1 } END { exit !found }' \"$file\"; then printf '%s\\n' \"$key\" >> \"$file\"; fi";
@@ -1989,7 +1991,8 @@ impl SshSocket {
         self.verify_managed_key(&generated.private_key_path, cx)
             .await
             .context("公钥已写入远程主机，但使用新密钥进行独立验证失败")?;
-        crate::managed_ssh_keys::mark_managed_ssh_key_verified(&generated.record.key_id)?;
+        crate::managed_ssh_keys::mark_managed_ssh_key_verified(&generated.record.key_id, cx)
+            .await?;
         self.delegate
             .append_connection_log("✓ Zed 专属 SSH 密钥已部署并验证", &mut cx.clone());
         Ok(())
