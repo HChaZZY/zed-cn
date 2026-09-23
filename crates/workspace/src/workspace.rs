@@ -43,6 +43,7 @@ pub use remote::{
 };
 pub use toast_layer::{ToastAction, ToastLayer, ToastView};
 
+use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
 use client::{
     ChannelId, Client, ErrorExt, ParticipantIndex, Status, TypedEnvelope, User, UserStore,
@@ -3677,9 +3678,9 @@ impl Workspace {
                     let answer = cx.update(|window, cx| {
                         window.prompt(
                             PromptLevel::Warning,
-                            "Do you want to leave the current call?",
+                            "确定要离开当前通话吗？",
                             None,
-                            &["Close window and hang up", "Cancel"],
+                            &["关闭窗口并挂断", "取消"],
                             cx,
                         )
                     })?;
@@ -3927,7 +3928,7 @@ impl Workspace {
                             PromptLevel::Warning,
                             "Do you want to save all changes in the following files?",
                             Some(&detail),
-                            &["Save all", "Discard all", "Cancel"],
+                            &["全部保存", "全部丢弃", "取消"],
                             cx,
                         )
                     })?;
@@ -4787,6 +4788,24 @@ impl Workspace {
 
         cx.notify();
         result_panel
+    }
+
+    /// Toggle whether the panel of the given type is visible, regardless of focus.
+    pub fn toggle_panel_visibility<T: Panel>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_visible = self.all_docks().iter().any(|dock| {
+            let dock = dock.read(cx);
+            dock.visible_panel()
+                .is_some_and(|panel| panel.panel_key() == T::panel_key())
+        });
+        if is_visible {
+            self.close_panel::<T>(window, cx);
+        } else {
+            self.focus_panel::<T>(window, cx);
+        }
     }
 
     /// Open the panel of the given type
@@ -10709,7 +10728,7 @@ pub fn join_channel(
                             PromptLevel::Critical,
                             "Failed to join channel",
                             Some(&detail),
-                            &["OK"],
+                            &["确定"],
                             cx,
                         )
                     })?
@@ -10767,6 +10786,61 @@ pub fn activate_any_workspace_window(cx: &mut AsyncApp) -> Option<WindowHandle<M
     })
 }
 
+fn same_workspace_host(left: &RemoteConnectionOptions, right: &RemoteConnectionOptions) -> bool {
+    match (left, right) {
+        (RemoteConnectionOptions::Ssh(a), RemoteConnectionOptions::Ssh(b)) => {
+            (&a.host, &a.username, &a.port) == (&b.host, &b.username, &b.port)
+        }
+        (RemoteConnectionOptions::Wsl(a), RemoteConnectionOptions::Wsl(b)) => {
+            // The WSL username is not consistently populated in the workspace location, so ignore it for now.
+            a.distro_name == b.distro_name
+        }
+        (RemoteConnectionOptions::Docker(a), RemoteConnectionOptions::Docker(b)) => {
+            a.container_id == b.container_id
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        (RemoteConnectionOptions::Mock(a), RemoteConnectionOptions::Mock(b)) => a.id == b.id,
+        _ => false,
+    }
+}
+
+fn workspace_matches_location(
+    workspace: &Entity<Workspace>,
+    serialized_location: &SerializedWorkspaceLocation,
+    cx: &App,
+) -> bool {
+    match (
+        workspace.read(cx).workspace_location(cx),
+        serialized_location,
+    ) {
+        (
+            WorkspaceLocation::Location(SerializedWorkspaceLocation::Local, _),
+            SerializedWorkspaceLocation::Local,
+        ) => true,
+        (
+            WorkspaceLocation::Location(SerializedWorkspaceLocation::Remote(left), _),
+            SerializedWorkspaceLocation::Remote(right),
+        ) => same_workspace_host(&left, right),
+        _ => false,
+    }
+}
+
+fn workspace_for_location(
+    multi_workspace: &MultiWorkspace,
+    serialized_location: &SerializedWorkspaceLocation,
+    cx: &App,
+) -> Option<Entity<Workspace>> {
+    let active_workspace = multi_workspace.workspace();
+    if workspace_matches_location(active_workspace, serialized_location, cx) {
+        return Some(active_workspace.clone());
+    }
+
+    multi_workspace
+        .workspaces()
+        .find(|workspace| workspace_matches_location(workspace, serialized_location, cx))
+        .cloned()
+}
+
 pub fn workspace_windows_for_location(
     serialized_location: &SerializedWorkspaceLocation,
     cx: &App,
@@ -10775,43 +10849,8 @@ pub fn workspace_windows_for_location(
         .into_iter()
         .filter_map(|window| window.downcast::<MultiWorkspace>())
         .filter(|multi_workspace| {
-            let same_host = |left: &RemoteConnectionOptions, right: &RemoteConnectionOptions| match (left, right) {
-                (RemoteConnectionOptions::Ssh(a), RemoteConnectionOptions::Ssh(b)) => {
-                    (&a.host, &a.username, &a.port) == (&b.host, &b.username, &b.port)
-                }
-                (RemoteConnectionOptions::Wsl(a), RemoteConnectionOptions::Wsl(b)) => {
-                    // The WSL username is not consistently populated in the workspace location, so ignore it for now.
-                    a.distro_name == b.distro_name
-                }
-                (RemoteConnectionOptions::Docker(a), RemoteConnectionOptions::Docker(b)) => {
-                    a.container_id == b.container_id
-                }
-                #[cfg(any(test, feature = "test-support"))]
-                (RemoteConnectionOptions::Mock(a), RemoteConnectionOptions::Mock(b)) => {
-                    a.id == b.id
-                }
-                _ => false,
-            };
-
             multi_workspace.read(cx).is_ok_and(|multi_workspace| {
-                multi_workspace.workspaces().any(|workspace| {
-                    match workspace.read(cx).workspace_location(cx) {
-                        WorkspaceLocation::Location(location, _) => {
-                            match (&location, serialized_location) {
-                                (
-                                    SerializedWorkspaceLocation::Local,
-                                    SerializedWorkspaceLocation::Local,
-                                ) => true,
-                                (
-                                    SerializedWorkspaceLocation::Remote(a),
-                                    SerializedWorkspaceLocation::Remote(b),
-                                ) => same_host(a, b),
-                                _ => false,
-                            }
-                        }
-                        _ => false,
-                    }
-                })
+                workspace_for_location(multi_workspace, serialized_location, cx).is_some()
             })
         })
         .collect()
@@ -10892,12 +10931,12 @@ pub async fn find_existing_workspace(
                     .and_then(|window| window.downcast::<MultiWorkspace>())
                     .filter(|window| windows.contains(window))
                     .or_else(|| windows.into_iter().next());
-                if let Some(window) = window {
-                    if let Ok(multi_workspace) = window.read(cx) {
-                        let active_workspace = multi_workspace.workspace().clone();
-                        existing = Some((window, active_workspace));
-                        open_visible = OpenVisible::None;
-                    }
+                if let Some(window) = window
+                    && let Ok(multi_workspace) = window.read(cx)
+                    && let Some(workspace) = workspace_for_location(multi_workspace, location, cx)
+                {
+                    existing = Some((window, workspace));
+                    open_visible = OpenVisible::None;
                 }
             });
         }
@@ -11131,12 +11170,16 @@ pub fn open_paths(
                         .and_then(|window| window.downcast::<MultiWorkspace>())
                         .filter(|window| windows.contains(window))
                         .or_else(|| windows.into_iter().next());
-                    if let Some(window) = window {
-                        if let Ok(multi_workspace) = window.read(cx) {
-                            let active_workspace = multi_workspace.workspace().clone();
-                            existing = Some((window, active_workspace));
-                            open_visible = OpenVisible::None;
-                        }
+                    if let Some(window) = window
+                        && let Ok(multi_workspace) = window.read(cx)
+                        && let Some(workspace) = workspace_for_location(
+                            multi_workspace,
+                            &SerializedWorkspaceLocation::Local,
+                            cx,
+                        )
+                    {
+                        existing = Some((window, workspace));
+                        open_visible = OpenVisible::None;
                     }
                 });
             }
@@ -11177,7 +11220,14 @@ pub fn open_paths(
                     open_options.requesting_window = Some(window);
                     window
                         .update(cx, |multi_workspace, _, cx| {
-                            multi_workspace.open_sidebar(cx);
+                            if AgentSettings::get_global(cx).threads_sidebar.auto_open {
+                                multi_workspace.open_sidebar(cx);
+                            } else {
+                                // Opening the sidebar is also what pins the
+                                // workspace we are about to navigate away from,
+                                // so pin it here to keep it in this window.
+                                multi_workspace.retain_active_workspace(cx);
+                            }
                         })
                         .log_err();
                 }
@@ -13087,7 +13137,7 @@ mod tests {
             w.prepare_to_close(CloseIntent::CloseWindow, window, cx)
         });
         cx.executor().run_until_parked();
-        cx.simulate_prompt_answer("Cancel"); // cancel save all
+        cx.simulate_prompt_answer("取消"); // cancel save all
         cx.executor().run_until_parked();
         assert!(!cx.has_pending_prompt());
         assert!(!task.await.unwrap());
@@ -13170,7 +13220,7 @@ mod tests {
             .unwrap();
 
         // User cancels the save prompt from workspace B
-        cx.simulate_prompt_answer("Cancel");
+        cx.simulate_prompt_answer("取消");
         cx.run_until_parked();
 
         // Window should still exist because workspace B's close was cancelled
@@ -13247,7 +13297,7 @@ mod tests {
             .unwrap();
 
         // Cancel the prompt — user stays on workspace B.
-        cx.simulate_prompt_answer("Cancel");
+        cx.simulate_prompt_answer("取消");
         cx.run_until_parked();
         let removed = remove_task.await.unwrap();
         assert!(!removed, "removal should have been cancelled");
@@ -13279,7 +13329,7 @@ mod tests {
         cx.run_until_parked();
 
         // Accept the save prompt.
-        cx.simulate_prompt_answer("Don't Save");
+        cx.simulate_prompt_answer("不保存");
         cx.run_until_parked();
         let removed = remove_task.await.unwrap();
         assert!(removed, "removal should have succeeded");
@@ -13373,7 +13423,7 @@ mod tests {
             "closing a no-folder workspace with a dirty serializable item should prompt, \
              since the workspace will not be reachable after close"
         );
-        cx.simulate_prompt_answer("Don't Save");
+        cx.simulate_prompt_answer("不保存");
         cx.executor().run_until_parked();
 
         assert!(task.await.unwrap());
@@ -13519,7 +13569,7 @@ mod tests {
             "replacing a workspace with a dirty serializable item should prompt, \
              since the workspace will be detached afterwards"
         );
-        cx.simulate_prompt_answer("Don't Save");
+        cx.simulate_prompt_answer("不保存");
         cx.executor().run_until_parked();
 
         assert!(task.await.unwrap());
@@ -13598,7 +13648,7 @@ mod tests {
             "a save/discard prompt should be shown for the dirty scratch item \
              when its serialization fails"
         );
-        cx.simulate_prompt_answer("Don't Save");
+        cx.simulate_prompt_answer("不保存");
         cx.executor().run_until_parked();
 
         // Preparing to close succeeds, even though serialization failed.
@@ -13660,7 +13710,7 @@ mod tests {
         cx.executor().run_until_parked();
 
         assert!(cx.has_pending_prompt());
-        cx.simulate_prompt_answer("Save all");
+        cx.simulate_prompt_answer("全部保存");
 
         cx.executor().run_until_parked();
 
@@ -13675,7 +13725,7 @@ mod tests {
         assert!(cx.has_pending_prompt());
 
         // Cancel saving item 3.
-        cx.simulate_prompt_answer("Discard Edits");
+        cx.simulate_prompt_answer("丢弃更改");
         cx.executor().run_until_parked();
 
         // Item 3 is reloaded. There's a prompt to save item 4.
@@ -13817,7 +13867,7 @@ mod tests {
 
         // With best-effort close, cancelling item 1 keeps it open but items 4
         // and (3,4) still close since their entries exist in left pane.
-        cx.simulate_prompt_answer("Cancel");
+        cx.simulate_prompt_answer("取消");
         close.await;
 
         right_pane.read_with(cx, |pane, _| {
@@ -13851,7 +13901,7 @@ mod tests {
         // But we can only save whole items, so saving (2,3) for entry 3 includes 2.
         // assert!(!details.contains("2.txt"));
 
-        cx.simulate_prompt_answer("Save all");
+        cx.simulate_prompt_answer("全部保存");
         cx.executor().run_until_parked();
         close.await;
 
@@ -14563,6 +14613,42 @@ mod tests {
             let (top, nested) = nested_axis(workspace);
             assert_eq!(*top.flexes.lock(), vec![1.0; top.members.len()]);
             assert_eq!(*nested.flexes.lock(), vec![1.0; nested.members.len()]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_toggle_panel_visibility_independent_of_focus(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_visibility::<TestPanel>(window, cx);
+            assert!(workspace.right_dock().read(cx).is_open());
+            assert!(panel.read(cx).focus_handle(cx).contains_focused(window, cx));
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<TestPanel>(window, cx);
+            assert!(!panel.read(cx).focus_handle(cx).contains_focused(window, cx));
+            assert!(workspace.right_dock().read(cx).is_open());
+            workspace.toggle_panel_visibility::<TestPanel>(window, cx);
+            assert!(!workspace.right_dock().read(cx).is_open());
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_visibility::<TestPanel>(window, cx);
+            assert!(workspace.right_dock().read(cx).is_open());
+            workspace.toggle_panel_visibility::<TestPanel>(window, cx);
+            assert!(!workspace.right_dock().read(cx).is_open());
         });
     }
 
@@ -17002,7 +17088,7 @@ mod tests {
             cx.has_pending_prompt(),
             "Dirty multi buffer should prompt a save dialog"
         );
-        cx.simulate_prompt_answer("Save");
+        cx.simulate_prompt_answer("保存");
         cx.background_executor.run_until_parked();
         close_multi_buffer_task
             .await

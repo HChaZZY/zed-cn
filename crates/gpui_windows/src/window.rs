@@ -68,7 +68,7 @@ pub struct WindowsWindowState {
     /// render. Used after a GPU device-lost recovery, where the next frame
     /// must both re-enable drawing (via `mark_drawable`) and bypass the GPUI
     /// view cache (which would otherwise replay stale atlas tile references
-    /// from the previous frame and panic in `DirectXAtlasState::texture`),
+    /// from the previous frame and panic in `DirectXAtlasTextures::texture`),
     /// and when a forced render was requested while another draw was in
     /// progress and had to be deferred.
     pub force_render_pending: Cell<bool>,
@@ -1438,6 +1438,8 @@ unsafe extern "system" fn window_procedure(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    let _wnd_proc_guard = WndProcGuard::enter();
+
     if msg == WM_NCCREATE {
         let window_params = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
         let window_creation_context = window_params.lpCreateParams as *mut WindowCreateContext;

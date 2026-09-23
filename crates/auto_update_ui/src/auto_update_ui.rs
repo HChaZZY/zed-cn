@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use agent_skills::GLOBAL_SKILLS_DIR_DISPLAY;
-use auto_update::{AutoUpdater, release_notes_url};
+use auto_update::{AutoUpdater, custom_release_notes, release_notes_url};
 use client::zed_urls;
 use db::kvp::Dismissable;
 use editor::{Editor, MultiBuffer};
@@ -106,6 +106,7 @@ fn view_release_notes_locally(
         return;
     }
 
+    let custom_release_tag = release_channel::CustomReleaseTag::current(cx);
     let version = AppVersion::global(cx).to_string();
 
     let client = client::Client::global(cx).http_client();
@@ -122,21 +123,29 @@ fn view_release_notes_locally(
 
     cx.spawn_in(window, async move |workspace, cx| {
         let markdown = markdown.await.log_err();
-        let response = client.get(&url, Default::default(), true).await;
-        let Some(mut response) = response.log_err() else {
-            workspace
-                .update_in(cx, notify_release_notes_failed_to_show)
-                .log_err();
-            return;
+        let body = if let Some(tag) = custom_release_tag {
+            custom_release_notes(client.clone(), &tag, cx.background_executor())
+                .await
+                .map(|notes| ReleaseNotesBody {
+                    title: notes.title,
+                    release_notes: notes.body,
+                })
+        } else {
+            let response = client.get(&url, Default::default(), true).await;
+            let Some(mut response) = response.log_err() else {
+                workspace
+                    .update_in(cx, notify_release_notes_failed_to_show)
+                    .log_err();
+                return;
+            };
+
+            let mut body = Vec::new();
+            response.body_mut().read_to_end(&mut body).await.ok();
+            serde_json::from_slice(body.as_slice()).log_err()
         };
 
-        let mut body = Vec::new();
-        response.body_mut().read_to_end(&mut body).await.ok();
-
-        let body: serde_json::Result<ReleaseNotesBody> = serde_json::from_slice(body.as_slice());
-
         let res: Option<()> = maybe!(async {
-            let body = body.ok()?;
+            let body = body?;
             let project = workspace
                 .read_with(cx, |workspace, _| workspace.project().clone())
                 .ok()?;
