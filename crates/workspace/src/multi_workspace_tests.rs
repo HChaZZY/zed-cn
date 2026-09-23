@@ -534,6 +534,50 @@ async fn test_project_group_keys_duplicate_not_added(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_project_group_keys_ignore_runtime_connection_fields(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+    let paths = PathList::new(&[PathBuf::from("/remote/project")]);
+    let options = remote::SshConnectionOptions {
+        host: "example.com".into(),
+        username: Some("dev".to_string()),
+        ..Default::default()
+    };
+    let mut drifted = options.clone();
+    drifted.nickname = Some("example-host".to_string());
+    drifted.upload_binary_over_ssh = true;
+    drifted.args = Some(vec!["-i".to_string(), "/zed/keys/id_ed25519".to_string()]);
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.restore_project_groups(
+            [options, drifted]
+                .into_iter()
+                .map(|options| SerializedProjectGroupState {
+                    key: ProjectGroupKey::new(
+                        Some(RemoteConnectionOptions::Ssh(options)),
+                        paths.clone(),
+                    ),
+                    expanded: true,
+                })
+                .collect(),
+            cx,
+        );
+    });
+
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(
+            multi_workspace.project_group_keys().len(),
+            1,
+            "runtime-only connection fields must not create a second project group"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_adding_worktree_updates_project_group_key(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());

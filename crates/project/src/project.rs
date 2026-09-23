@@ -114,7 +114,10 @@ pub use prettier_store::PrettierStore;
 use project_settings::{ProjectSettings, SettingsObserver, SettingsObserverEvent};
 #[cfg(target_os = "windows")]
 use remote::wsl_path_to_windows_path;
-use remote::{RemoteClient, RemoteConnectionOptions, same_remote_connection_identity};
+use remote::{
+    RemoteClient, RemoteConnectionIdentity, RemoteConnectionOptions, remote_connection_identity,
+    same_remote_connection_identity,
+};
 use rpc::{
     AnyProtoClient, ErrorCode,
     proto::{LanguageServerPromptResponse, REMOTE_SERVER_PROJECT_ID},
@@ -6663,11 +6666,34 @@ impl Project {
 ///
 /// Paths are mapped to their main worktree path first so we can group
 /// workspaces by main repos.
-#[derive(PartialEq, Eq, Hash, Clone, Debug, Default)]
+///
+/// Groups are compared by their paths and by the stable identity of the remote
+/// host, so runtime-only connection fields (nicknames, SSH key arguments,
+/// download settings) never split one project into several groups.
+#[derive(Clone, Debug, Default)]
 pub struct ProjectGroupKey {
     /// The paths of the main worktrees for this project group.
     paths: PathList,
     host: Option<RemoteConnectionOptions>,
+}
+
+impl PartialEq for ProjectGroupKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.paths.distinct_paths() == other.paths.distinct_paths()
+            && same_remote_connection_identity(self.host.as_ref(), other.host.as_ref())
+    }
+}
+
+impl Eq for ProjectGroupKey {}
+
+impl std::hash::Hash for ProjectGroupKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.paths.distinct_paths().hash(state);
+        match self.host.as_ref() {
+            Some(host) => Some(remote_connection_identity(host)).hash(state),
+            None => Option::<RemoteConnectionIdentity>::None.hash(state),
+        }
+    }
 }
 
 impl ProjectGroupKey {
@@ -6731,9 +6757,12 @@ impl ProjectGroupKey {
         self.host.clone()
     }
 
+    /// Whether this key identifies the same project group as `other`.
+    ///
+    /// This is the same comparison as [`PartialEq`], named for call sites that
+    /// match one key against several candidates.
     pub fn matches(&self, other: &ProjectGroupKey) -> bool {
-        self.paths == other.paths
-            && same_remote_connection_identity(self.host.as_ref(), other.host.as_ref())
+        self == other
     }
 }
 
