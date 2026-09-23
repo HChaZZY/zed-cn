@@ -1,6 +1,7 @@
 use gpui::{
-    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
-    Render, StatefulInteractiveElement as _, Task, WeakEntity, Window, actions, px,
+    Action, App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla,
+    InteractiveElement as _, Render, StatefulInteractiveElement as _, Task, WeakEntity, Window,
+    actions, px,
 };
 use proto::GetSystemStatsResponse;
 use std::{collections::VecDeque, time::Duration};
@@ -230,15 +231,19 @@ impl SystemMonitor {
         let content = if let Some(stats) = self.stats.as_ref() {
             v_flex()
                 .w(px(280.))
+                .min_w_0()
                 .gap_2()
                 .child(
                     h_flex()
+                        .min_w_0()
                         .justify_between()
+                        .gap_2()
                         .child(Label::new(format!("{}运行状态", self.target_label())))
                         .child(
                             Label::new(stats.hostname.clone())
                                 .size(LabelSize::Small)
-                                .color(Color::Muted),
+                                .color(Color::Muted)
+                                .truncate(),
                         ),
                 )
                 .child(metric_line(
@@ -278,6 +283,7 @@ impl SystemMonitor {
         } else {
             v_flex()
                 .w(px(280.))
+                .min_w_0()
                 .gap_1()
                 .child(Label::new(format!("{}运行状态", self.target_label())))
                 .child(
@@ -397,34 +403,53 @@ impl Render for SystemMonitorPanel {
             .id("system-monitor-panel")
             .size_full()
             .track_focus(&self.focus_handle)
+            .overflow_x_hidden()
             .overflow_y_scroll()
             .p_3()
-            .gap_3()
+            .gap_2()
             .bg(cx.theme().colors().panel_background)
             .child(
                 h_flex()
+                    .w_full()
+                    .min_w_0()
                     .justify_between()
+                    .gap_2()
                     .child(
                         h_flex()
-                            .gap_2()
-                            .child(Icon::new(IconName::Gauge).color(Color::Accent))
-                            .child(Label::new("系统监控")),
+                            .flex_none()
+                            .gap_1p5()
+                            .child(
+                                Icon::new(IconName::Gauge)
+                                    .size(IconSize::Small)
+                                    .color(Color::Accent),
+                            )
+                            .child(Label::new("系统监控").weight(FontWeight::MEDIUM)),
                     )
                     .child(
                         Label::new(monitor.target_label())
                             .size(LabelSize::Small)
-                            .color(Color::Muted),
+                            .color(Color::Muted)
+                            .truncate(),
                     ),
             )
             .when_some(stats, |element, stats| {
                 element
-                    .child(system_card(stats))
+                    .child(system_card(stats, cx))
                     .child(resource_card(
                         "CPU",
                         IconName::Gauge,
                         stats.cpu_usage_percent,
                         format!("{:.1}%", stats.cpu_usage_percent),
-                        Some(history_bars(&monitor.cpu_history, 100.)),
+                        Some(
+                            sparkline_bars(
+                                &monitor.cpu_history,
+                                100.,
+                                24.,
+                                usage_color(stats.cpu_usage_percent, cx),
+                            )
+                            .w_full()
+                            .into_any_element(),
+                        ),
                         cx,
                     ))
                     .child(resource_card(
@@ -455,64 +480,90 @@ impl Render for SystemMonitorPanel {
             })
             .when(stats.is_none(), |element| {
                 element.child(
-                    v_flex()
-                        .p_3()
-                        .gap_2()
-                        .border_1()
-                        .border_color(cx.theme().colors().border)
-                        .rounded_md()
-                        .child(Label::new(
+                    card(cx).child(
+                        Label::new(
                             monitor
                                 .error
                                 .clone()
                                 .unwrap_or_else(|| "正在读取系统状态…".into()),
-                        )),
+                        )
+                        .color(if monitor.error.is_some() {
+                            Color::Error
+                        } else {
+                            Color::Muted
+                        }),
+                    ),
                 )
             })
     }
 }
 
-fn system_card(stats: &SystemStats) -> impl IntoElement {
+fn card(cx: &App) -> Div {
     v_flex()
+        .w_full()
+        .min_w_0()
         .p_3()
         .gap_2()
         .border_1()
-        .border_color(gpui::transparent_black())
-        .rounded_md()
-        .bg(gpui::transparent_black().opacity(0.08))
+        .border_color(cx.theme().colors().border_variant)
+        .rounded_lg()
+        .bg(cx.theme().colors().element_background)
+}
+
+fn usage_color(percent: f32, cx: &App) -> Hsla {
+    let status = cx.theme().status();
+    if percent >= 90. {
+        status.error
+    } else if percent >= 75. {
+        status.warning
+    } else {
+        status.info
+    }
+}
+
+fn system_card(stats: &SystemStats, cx: &App) -> impl IntoElement {
+    card(cx)
+        .gap_1()
         .child(
             h_flex()
+                .w_full()
+                .min_w_0()
                 .justify_between()
-                .child(Label::new(stats.hostname.clone()))
+                .gap_2()
+                .child(
+                    Label::new(stats.hostname.clone())
+                        .weight(FontWeight::MEDIUM)
+                        .truncate(),
+                )
                 .child(
                     Label::new(format_uptime(stats.uptime_seconds))
                         .size(LabelSize::Small)
-                        .color(Color::Accent),
+                        .color(Color::Accent)
+                        .flex_none(),
                 ),
         )
         .child(
             Label::new(stats.os_name.clone())
                 .size(LabelSize::Small)
-                .color(Color::Muted),
+                .color(Color::Muted)
+                .truncate(),
         )
         .when(!stats.kernel_version.is_empty(), |element| {
             element.child(
                 Label::new(format!("内核 {}", stats.kernel_version))
                     .size(LabelSize::Small)
-                    .color(Color::Muted),
+                    .color(Color::Muted)
+                    .truncate(),
             )
         })
-        .child(
-            Label::new(format!(
-                "进程 {} · 负载 {:.2}  {:.2}  {:.2}",
-                stats.process_count,
-                stats.load_average[0],
-                stats.load_average[1],
-                stats.load_average[2]
-            ))
-            .size(LabelSize::Small)
-            .color(Color::Muted),
-        )
+        .child(metric_line("进程", stats.process_count.to_string()))
+        .child(metric_line(
+            "负载",
+            format!(
+                "{:.2} · {:.2} · {:.2}",
+                stats.load_average[0], stats.load_average[1], stats.load_average[2]
+            ),
+        ))
 }
 
 fn resource_card(
@@ -523,29 +574,33 @@ fn resource_card(
     history: Option<gpui::AnyElement>,
     cx: &App,
 ) -> impl IntoElement {
-    v_flex()
-        .p_3()
-        .gap_2()
-        .border_1()
-        .border_color(cx.theme().colors().border)
-        .rounded_md()
+    card(cx)
         .child(
             h_flex()
+                .w_full()
+                .min_w_0()
                 .justify_between()
+                .gap_2()
                 .child(
                     h_flex()
-                        .gap_2()
+                        .min_w_0()
+                        .gap_1p5()
                         .child(Icon::new(icon).size(IconSize::Small).color(Color::Accent))
-                        .child(Label::new(title)),
+                        .child(Label::new(title).truncate()),
                 )
-                .child(Label::new(value).size(LabelSize::Small)),
+                .child(
+                    Label::new(value)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .flex_none(),
+                ),
         )
         .when_some(history, |element, history| element.child(history))
-        .child(ProgressBar::new(title, percent, 100., cx))
+        .child(ProgressBar::new(title, percent, 100., cx).fg_color(usage_color(percent, cx)))
 }
 
 fn network_card(stats: &SystemStats, monitor: &SystemMonitor, cx: &App) -> impl IntoElement {
-    let max_rate = monitor
+    let maximum = monitor
         .download_history
         .iter()
         .chain(monitor.upload_history.iter())
@@ -553,15 +608,12 @@ fn network_card(stats: &SystemStats, monitor: &SystemMonitor, cx: &App) -> impl 
         .max()
         .unwrap_or(1)
         .max(1) as f32;
-    v_flex()
-        .p_3()
-        .gap_2()
-        .border_1()
-        .border_color(cx.theme().colors().border)
-        .rounded_md()
+    card(cx)
         .child(
             h_flex()
-                .gap_2()
+                .w_full()
+                .min_w_0()
+                .gap_1p5()
                 .child(
                     Icon::new(IconName::Public)
                         .size(IconSize::Small)
@@ -569,48 +621,84 @@ fn network_card(stats: &SystemStats, monitor: &SystemMonitor, cx: &App) -> impl 
                 )
                 .child(Label::new("网络")),
         )
-        .child(history_bars_u64(&monitor.download_history, max_rate))
-        .child(metric_line(
+        .child(network_row(
             "下载",
-            format!(
-                "{}/s",
-                format_bytes(stats.network_received_bytes_per_second)
-            ),
+            &monitor.download_history,
+            maximum,
+            stats.network_received_bytes_per_second,
+            cx.theme().status().info,
         ))
-        .child(metric_line(
+        .child(network_row(
             "上传",
-            format!(
-                "{}/s",
-                format_bytes(stats.network_transmitted_bytes_per_second)
-            ),
+            &monitor.upload_history,
+            maximum,
+            stats.network_transmitted_bytes_per_second,
+            cx.theme().status().success,
         ))
 }
 
-fn history_bars(values: &VecDeque<f32>, maximum: f32) -> gpui::AnyElement {
+fn network_row(
+    label: &'static str,
+    history: &VecDeque<u64>,
+    maximum: f32,
+    current: u64,
+    color: Hsla,
+) -> impl IntoElement {
+    let values: VecDeque<f32> = history.iter().map(|value| *value as f32).collect();
     h_flex()
-        .h_8()
-        .items_end()
-        .gap_px()
-        .children(values.iter().enumerate().map(|(index, value)| {
-            div()
-                .id(("history", index))
-                .w_1()
-                .h(relative((*value / maximum).clamp(0.04, 1.)))
-                .bg(gpui::blue())
-        }))
-        .into_any_element()
+        .w_full()
+        .min_w_0()
+        .items_center()
+        .gap_2()
+        .child(
+            Label::new(label)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .flex_none(),
+        )
+        .child(
+            sparkline_bars(&values, maximum, 16., color)
+                .flex_1()
+                .min_w(px(24.)),
+        )
+        .child(
+            Label::new(format!("{}/s", format_bytes(current)))
+                .size(LabelSize::Small)
+                .flex_none(),
+        )
 }
 
-fn history_bars_u64(values: &VecDeque<u64>, maximum: f32) -> gpui::AnyElement {
-    let values = values.iter().map(|value| *value as f32).collect();
-    history_bars(&values, maximum)
+// The bars share their container's width, so callers must place the result in a
+// row with `flex_1`, or in a column with `w_full`; a column child that grows would
+// collapse to a zero flex basis instead of keeping its height.
+fn sparkline_bars(values: &VecDeque<f32>, maximum: f32, height: f32, color: Hsla) -> Div {
+    h_flex()
+        .items_end()
+        .h(px(height))
+        .gap_px()
+        .children(values.iter().map(|value| {
+            div()
+                .flex_1()
+                .min_w(px(1.))
+                .h(relative((*value / maximum).clamp(0.06, 1.)))
+                .rounded_t_xs()
+                .bg(color)
+        }))
 }
 
 fn metric_line(label: &'static str, value: String) -> impl IntoElement {
     h_flex()
+        .w_full()
+        .min_w_0()
         .justify_between()
-        .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
-        .child(Label::new(value).size(LabelSize::Small))
+        .gap_2()
+        .child(
+            Label::new(label)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .truncate(),
+        )
+        .child(Label::new(value).size(LabelSize::Small).flex_none())
 }
 
 fn push_history<T>(history: &mut VecDeque<T>, value: T) {

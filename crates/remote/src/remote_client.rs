@@ -43,7 +43,7 @@ use std::{
     ops::ControlFlow,
     path::PathBuf,
     sync::{
-        Arc, Weak,
+        Arc, LazyLock, Weak,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::SeqCst},
     },
     time::{Duration, Instant},
@@ -402,24 +402,91 @@ impl ConnectionIdentifier {
         Self::Setup(NEXT_ID.fetch_add(1, SeqCst))
     }
 
-    // This string gets used in a socket name, and so must be relatively short.
+    // This string gets used as a socket name on the remote server, and so must
+    // be relatively short.
     // The total length of:
     //   /home/{username}/.local/share/zed/server_state/{name}/stdout.sock
     // Must be less than about 100 characters
     //   https://unix.stackexchange.com/questions/367008/why-is-socket-path-length-limited-to-a-hundred-chars
     // So our strings should be at most 20 characters or so.
+    //
+    // The name is namespaced to the installation that created it: launching a
+    // proxy replaces the server that already holds the same identifier, and the
+    // ids below are numbered per machine, so without a machine scope two
+    // machines connecting to the same remote account would silently kill each
+    // other's sessions.
     fn to_string(&self, cx: &App) -> String {
         let identifier_prefix = match ReleaseChannel::global(cx) {
             ReleaseChannel::Stable => "".to_string(),
             release_channel => format!("{}-", release_channel.dev_name()),
         };
+        let machine_scope = machine_scope(cx);
         match self {
-            Self::Setup(setup_id) => format!("{identifier_prefix}setup-{setup_id}"),
+            Self::Setup(setup_id) => {
+                format!("{identifier_prefix}{machine_scope}-setup-{setup_id}")
+            }
             Self::Workspace(workspace_id) => {
-                format!("{identifier_prefix}workspace-{workspace_id}",)
+                format!("{identifier_prefix}{machine_scope}-ws-{workspace_id}")
             }
         }
     }
+}
+
+/// How many characters of the installation id namespace remote server session
+/// names.
+///
+/// Eight base 36 digits carry 41 bits, which separates installations by a wide
+/// margin while leaving room for the release-channel and Zed CN prefixes within
+/// the socket path limit documented on [`ConnectionIdentifier::to_string`].
+const MACHINE_SCOPE_LENGTH: usize = 8;
+
+/// Derived from the installation id, and used until that id has been loaded, so
+/// that session names are never shared across machines.
+static EPHEMERAL_MACHINE_SCOPE: LazyLock<String> =
+    LazyLock::new(|| encode_machine_scope(uuid::Uuid::new_v4().as_u128()));
+
+/// Encodes the high bits of an installation id in base 36.
+///
+/// Base 36 packs more entropy per character than hex, which matters because the
+/// result becomes part of a socket path with a hard length limit.
+fn encode_machine_scope(installation_id: u128) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut encoded = String::with_capacity(MACHINE_SCOPE_LENGTH);
+    let mut remaining = installation_id;
+    for _ in 0..MACHINE_SCOPE_LENGTH {
+        encoded.push(DIGITS[(remaining % 36) as usize] as char);
+        remaining /= 36;
+    }
+    encoded.chars().rev().collect()
+}
+
+/// Namespaces remote server session names to a single installation.
+///
+/// See [`ConnectionIdentifier::to_string`] for why session names must not be
+/// shared between machines.
+#[derive(Clone, Default)]
+pub struct MachineIdentity(Option<Arc<str>>);
+
+impl Global for MachineIdentity {}
+
+impl MachineIdentity {
+    /// Namespaces session names to the installation identified by
+    /// `installation_id`, which is ignored when it is not a UUID.
+    pub fn new(installation_id: impl AsRef<str>) -> Self {
+        let scope = uuid::Uuid::parse_str(installation_id.as_ref())
+            .ok()
+            .map(|id| encode_machine_scope(id.as_u128()));
+        Self(scope.map(|scope| Arc::from(scope.as_str())))
+    }
+}
+
+/// The namespace remote server session names are scoped to on this
+/// installation.
+fn machine_scope(cx: &App) -> String {
+    cx.try_global::<MachineIdentity>()
+        .and_then(|identity| identity.0.clone())
+        .map(|scope| scope.to_string())
+        .unwrap_or_else(|| EPHEMERAL_MACHINE_SCOPE.clone())
 }
 
 #[derive(Clone, Debug, RegisterSetting)]
@@ -2012,6 +2079,72 @@ mod tests {
             settings::RemoteServerSource::ZedCn
         );
         assert!(effective.upload_binary_over_ssh);
+    }
+
+    #[gpui::test]
+    fn machine_identity_scopes_remote_server_session_names(cx: &mut App) {
+        release_channel::init(Version::new(0, 0, 0), cx);
+        // Without a seeded installation the scope is still stable within the
+        // process, so a session name is never shared between machines.
+        let fallback = ConnectionIdentifier::Workspace(7).to_string(cx);
+        assert_eq!(fallback, ConnectionIdentifier::Workspace(7).to_string(cx));
+        assert!(fallback.ends_with("-ws-7"), "{fallback}");
+
+        let scope = MachineIdentity::new("01234567-89ab-cdef-0123-456789abcdef").0;
+        let scope = scope.expect("a UUID installation id scopes session names");
+        assert_eq!(scope.len(), MACHINE_SCOPE_LENGTH);
+        cx.set_global(MachineIdentity(Some(scope.clone())));
+
+        let this_machine = ConnectionIdentifier::Workspace(7).to_string(cx);
+        assert_eq!(
+            this_machine,
+            ConnectionIdentifier::Workspace(7).to_string(cx)
+        );
+        assert!(
+            this_machine.contains(&format!("{scope}-")),
+            "{this_machine}"
+        );
+        assert!(this_machine.ends_with("-ws-7"), "{this_machine}");
+        assert_ne!(this_machine, fallback);
+
+        // The same workspace id on another machine must name another session.
+        cx.set_global(MachineIdentity::new("fedcba98-7654-3210-fedc-ba9876543210"));
+        let other_machine = ConnectionIdentifier::Workspace(7).to_string(cx);
+        assert_ne!(this_machine, other_machine);
+        assert!(
+            !other_machine.contains(&format!("{scope}-")),
+            "{other_machine}"
+        );
+
+        // Setup sessions are scoped the same way.
+        let setup = ConnectionIdentifier::Setup(1).to_string(cx);
+        assert!(setup.ends_with("-setup-1"), "{setup}");
+        assert_ne!(setup, other_machine);
+
+        // An installation id that is not a UUID must not produce an unscoped
+        // name.
+        cx.set_global(MachineIdentity::new("not-a-uuid"));
+        assert_eq!(ConnectionIdentifier::Workspace(7).to_string(cx), fallback);
+    }
+
+    #[gpui::test]
+    fn remote_server_session_names_fit_the_socket_path_limit(cx: &mut App) {
+        release_channel::init(Version::new(0, 0, 0), cx);
+        cx.set_global(MachineIdentity::new("01234567-89ab-cdef-0123-456789abcdef"));
+        let name = ConnectionIdentifier::Workspace(999_999).to_string(cx);
+        // Rebuild the worst case: the longest release channel prefix, the Zed CN
+        // source prefix, and a very long username.
+        let (_, unscoped_name) = name.split_at(name.find('-').unwrap() + 1);
+        let longest_name = format!("nightly-cn-{unscoped_name}");
+        let path = format!(
+            "/home/{}/.local/share/zed/server_state/{longest_name}/stdout.sock",
+            "a-twenty-char-user"
+        );
+        assert!(
+            path.len() < 100,
+            "socket path {path} is {} characters",
+            path.len()
+        );
     }
 
     #[test]
