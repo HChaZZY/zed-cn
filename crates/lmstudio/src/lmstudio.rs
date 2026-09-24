@@ -270,6 +270,8 @@ pub enum ModelType {
     Llm,
     Embeddings,
     Vlm,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -423,6 +425,46 @@ mod tests {
         assert_eq!(entry.state, ModelState::Loaded);
         assert_eq!(entry.compatibility_type, CompatibilityType::Gguf);
         assert!(entry.capabilities.is_empty());
+    }
+
+    #[test]
+    fn parse_models_with_provider_specific_types() -> Result<()> {
+        let body = r#"{
+            "object": "list",
+            "data": [
+                {"id": "compatible-model", "object": "model", "type": "model"},
+                {"id": "future-model", "type": "future-type"},
+                {"id": "text-model", "type": "llm", "max_context_length": 32768},
+                {"id": "embedding-model", "type": "embeddings"},
+                {
+                    "id": "vision-model",
+                    "type": "vlm",
+                    "loaded_context_length": 8192,
+                    "capabilities": ["vision", "tool_use"]
+                }
+            ]
+        }"#;
+        let response: ListModelsResponse = serde_json::from_str(body)?;
+        let entries = response.data;
+        assert_eq!(entries.len(), 5);
+        let mut entries = entries.into_iter();
+        let compatible = entries.next().context("missing compatible model")?;
+        assert_eq!(compatible.id, "compatible-model");
+        assert_eq!(compatible.object, "model");
+        assert_eq!(compatible.r#type, ModelType::Unknown);
+        let future = entries.next().context("missing future model")?;
+        assert_eq!(future.r#type, ModelType::Unknown);
+        let text = entries.next().context("missing text model")?;
+        assert_eq!(text.r#type, ModelType::Llm);
+        assert_eq!(text.max_context_length, Some(32768));
+        let embedding = entries.next().context("missing embedding model")?;
+        assert_eq!(embedding.r#type, ModelType::Embeddings);
+        let vision = entries.next().context("missing vision model")?;
+        assert_eq!(vision.r#type, ModelType::Vlm);
+        assert_eq!(vision.loaded_context_length, Some(8192));
+        assert!(vision.capabilities.supports_images());
+        assert!(vision.capabilities.supports_tool_calls());
+        Ok(())
     }
 
     #[test]
